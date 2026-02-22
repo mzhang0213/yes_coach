@@ -1,7 +1,9 @@
-import cv2
+import cv2 as cv
 import numpy as np
 from mss import mss
 import time
+
+from server.utils import GameState
 
 
 def screen_capture_opencv():
@@ -28,7 +30,21 @@ def screen_capture_opencv():
 
 
 if __name__ == "__main__":
-    print("OpenCV Screen Capture Demo")
-    print("Press 'q' to quit")
-    print("\nStarting screen capture...")
-    screen_capture_opencv()
+    # print("OpenCV Screen Capture Demo")
+    # print("Press 'q' to quit")
+    # print("\nStarting screen capture...")
+    # screen_capture_opencv()
+    control = cv.imread("./keys/test_control.png")
+    test = cv.imread("./keys/test_control.png")
+
+    gs_control = GameState(control)
+    gs_test = GameState(test)
+    control_data = gs_control.read_values()
+    full = control_data["gamestats"]["full_roi"]
+
+    while True:
+        cv.imshow("res", full)
+
+        if cv.waitKey(1) & 0xFF == ord('q'):
+            break
+
