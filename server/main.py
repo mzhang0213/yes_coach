@@ -39,8 +39,8 @@ if __name__ == "__main__":
 
     gs_control = GameState(control)
     gs_test = GameState(test)
-    control_data = gs_control.read_values()
-    full = control_data["gamestats"]["full_roi"]
+    data = gs_control.read_values()
+    full = data["gamestats"]["full_roi"]
 
     while True:
         cv.imshow("res", full)

@@ -4,6 +4,10 @@ import os
 import pytesseract
 from matplotlib import pyplot as plt
 
+# class MDebug:
+#     def _in
+
+
 KEYS = ["gamestats", "hotbar", "items", "map", "playerstats"]
 
 class GameState:
