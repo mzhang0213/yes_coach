@@ -1,0 +1,34 @@
+import cv2
+import numpy as np
+from mss import mss
+import time
+
+
+def screen_capture_opencv():
+    """
+    Screen capture using OpenCV with MSS (more efficient than VideoCapture(0))
+    """
+    with mss() as sct:
+        monitor = sct.monitors[1] #just screen 1 ([0] is all displays)
+        print(f"Capturing screen: {monitor}")
+        
+        while True:
+            frame = np.array(sct.grab(monitor))
+            
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+            
+            cv2.imshow('Screen Capture', frame)
+            
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+    
+    cv2.destroyAllWindows()
+
+
+
+
+if __name__ == "__main__":
+    print("OpenCV Screen Capture Demo")
+    print("Press 'q' to quit")
+    print("\nStarting screen capture...")
+    screen_capture_opencv()
