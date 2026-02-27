@@ -4,11 +4,48 @@ import os
 import pytesseract
 from matplotlib import pyplot as plt
 
-# class MDebug:
-#     def _in
+class MDebug:
+    def __init__(self):
+        self.info = []
+
+    def log_msg(self, msg):
+        self.info.append({"msg":msg})
+
+    def log_img(self, img, name):
+        self.info.append({"name":name, "img":img})
 
 
-KEYS = ["gamestats", "hotbar", "items", "map", "playerstats"]
+
+KEYS = {
+    #screen_feature: (tl,br)
+    "gamestats":((0.75,0),(1,0.2)),
+    "hotbar":((0,0.5),(1,1)),
+    "items":((0.5,0.75),(0.9,1)),
+    "map":((0.5,0.5),(1,1)),
+    "playerstats":((0,0.5),(0.5,1))
+}
+# KEYS = [
+#     {
+#         "name":"gamestats",
+#         "box":((0.75,0),(1,0.2))
+#     },
+#     {
+#         "name":"hotbar",
+#         "box":((0,0.5),(1,1))
+#     },
+#     {
+#         "name":"items",
+#         "box":((0.5,0.75),(0.9,1))
+#     },
+#     {
+#         "name":"map",
+#         "box":((0.5,0.5),(1,1))
+#     },
+#     {
+#         "name":"playerstats",
+#         "box":((0,0.5),(0.5,1))
+#     }
+# ]
 
 class GameState:
 
@@ -74,7 +111,7 @@ class GameState:
 
         return filtered_data, indices
 
-    def get_box(self, target) -> tuple[tuple[int, int], tuple[int, int]]:
+    def get_box(self, target, tl:tuple[int,int], br:tuple[int,int]) -> tuple[tuple[int, int], tuple[int, int]]:
         """
         Retrieves the bounding box on the screen containing target (key image).
         :param target: target image as np.array image
@@ -84,9 +121,17 @@ class GameState:
         #(note minor edits made)
         assert self.img is not None, "this game state's img could not be read"
         assert target is not None, "target image is None"
+        if tl == (-1, -1):
+            tl = (0,0)
+        if br == (-1, -1):
+            br = tuple(self.img.shape[::-1])
 
+        # Store original coordinates offset
+        offset_x, offset_y = tl[0], tl[1]
+        
         # Template matching works best in grayscale or with matched channels
-        img = cv.cvtColor(self.img, cv.COLOR_BGR2GRAY)
+        img = self.img[tl[1]:br[1],tl[0]:br[0]]
+        img = cv.cvtColor(img, cv.COLOR_BGR2GRAY)
         if len(target.shape) == 3:
             target = cv.cvtColor(target, cv.COLOR_BGR2GRAY)
 
@@ -110,6 +155,10 @@ class GameState:
             else:
                 top_left = int(max_loc[0]), int(max_loc[1])
             bottom_right = int(top_left[0] + w), int(top_left[1] + h)
+
+            # Adjust coordinates back to original image space
+            top_left = (top_left[0] + offset_x, top_left[1] + offset_y)
+            bottom_right = (bottom_right[0] + offset_x, bottom_right[1] + offset_y)
 
             curr_box = top_left,bottom_right
             results.append(curr_box)
@@ -162,9 +211,9 @@ class GameState:
     #
     #     }
 
-    def read_values(self):
+    def get_boxes(self):
         """
-        Analyzes the current image and returns structured data based on detected keys.
+        Analyzes the current game screen and returns structured data based on detected keys.
         """
         data = {}
 
@@ -173,36 +222,44 @@ class GameState:
                 continue
 
             target = self.key_images[key_name]
-            tl, br = self.get_box(target)
+            tl, br = self.get_box(target, KEYS[key_name][0],KEYS[key_name][1])
 
-            # Simple validation: if we found it, the content is at self.img[tl[1]:br[1], tl[0]:br[0]]
-            # For gamestats, we can further subdivide
             if key_name == "gamestats":
-                stats_roi = self.img[tl[1]:br[1], tl[0]:br[0]]
-                h, w = stats_roi.shape[:2]
-
+                h, w = self.img[tl[1]:br[1], tl[0]:br[0]][:2]
                 # KDA: approx 250 to 400
-                kda_roi = stats_roi[:, int(0.42*w):int(0.68*w)]
+                kda_box = (int(0.42 * w),(0.68 * w)),(0,h)
                 # CS: approx 450 to 520
-                cs_roi = stats_roi[:, int(0.76*w):int(0.88*w)]
+                cs_box = (int(0.76 * w),int(0.88 * w)),(0,h)
                 # Clock: approx 530 to 590
-                clock_roi = stats_roi[:, int(0.9*w):w]
+                clock_box = (int(0.9 * w),w),(0,h)
                 # Score: approx 0 to 150
-                score_roi = stats_roi[:, :int(0.25*w)]
+                score_box = (0,int(0.25 * w)),(0,h)
 
                 data["gamestats"] = {
-                    "full_roi": stats_roi,
-                    "sub_rois": {
-                        "score": score_roi,
-                        "kda": kda_roi,
-                        "cs": cs_roi,
-                        "clock": clock_roi
+                    "full": (tl,br),
+                    "sections": {
+                        "score": score_box,
+                        "kda": kda_box,
+                        "cs": cs_box,
+                        "clock": clock_box
                     }
                 }
             else:
-                data[key_name] = self.img[tl[1]:br[1], tl[0]:br[0]]
+                data[key_name] = {
+                    "full": (tl,br)
+                }
 
         return data
 
+    def extract_box(self,tl:tuple[int,int],br:tuple[int,int]):
+        return self.img[tl[1]:br[1],tl[0],br[0]]
+
+    def display_boxes(self):
+        boxes = self.get_boxes()
+        for key in KEYS:
+            og = self.img.copy()
+            cv.rectangle(og, boxes[key]["full"][0], boxes[key]["full"][1], (0,255,0))
+            cv.imshow(key, og)
+
     def export_state(self):
-        return self.read_values()
+        return self.get_boxes()
