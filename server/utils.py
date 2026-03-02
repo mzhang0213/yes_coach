@@ -10,7 +10,11 @@ import sys
 from PyQt6.QtWidgets import QMainWindow, QWidget
 from PyQt6.QtCore import Qt, QRect
 from PyQt6.QtGui import QPainter, QPen, QColor, QBrush
-import sys
+from mss import mss
+import time
+import platform
+import threading
+from queue import Queue
 
 class MDebug:
     def __init__(self):
@@ -283,7 +287,7 @@ class GameState:
         return data
 
     def extract_box(self,tl:tuple[int,int],br:tuple[int,int]):
-        return self.img[tl[1]:br[1],tl[0],br[0]]
+        return self.img[tl[1]:br[1],tl[0]:br[0]]
 
     def display_boxes(self):
         boxes = self.get_boxes()
@@ -482,3 +486,162 @@ class Overlay(QMainWindow):
             int((br[0] / img_w) * SCREEN_SIZE[0]),
             int((br[1] / img_h) * SCREEN_SIZE[1])
         )
+
+DYDX = []
+
+class ScreenCapture:
+    def __init__(self):
+        self.running = False
+        self.capture_thread = None
+        self.last_frame = None
+        self.frame_lock = threading.Lock()
+        self.process_callback = None
+        self.process_interval = 1.0
+        self.last_process_time = 0
+        self.process_queue = Queue(maxsize=1)  # For processing callback
+        self.display_queue = Queue(maxsize=1)  # For main-thread display
+
+    def start_capture(self, process_callback=None, process_interval=1.0):
+        if self.running:
+            print("Screen capture is already running.")
+            return False
+
+        self.process_callback = process_callback
+        self.process_interval = process_interval
+        self.running = True
+
+        self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self.capture_thread.start()
+        print("Screen capture started in background.")
+        return True
+
+    def stop_capture(self):
+        if not self.running:
+            return False
+        self.running = False
+        if self.capture_thread and self.capture_thread.is_alive():
+            self.capture_thread.join(timeout=2)
+        cv.destroyAllWindows()  # Safe — called from main thread by caller
+        print("Screen capture stopped.")
+        return True
+
+    def get_latest_frame(self):
+        with self.frame_lock:
+            return self.last_frame
+
+    def pump_display(self):
+        """
+        Call this repeatedly from the MAIN THREAD to show frames and handle GUI events.
+        Returns False if 'q' was pressed (signal to stop), True otherwise.
+        """
+        if not self.display_queue.empty():
+            try:
+                frame = self.display_queue.get_nowait()
+                cv.imshow('Live Screen Capture', frame)
+            except Exception:
+                pass
+
+        key = cv.waitKey(1)
+        if key & 0xFF == ord('q'):
+            print("'q' pressed, stopping capture...")
+            self.running = False
+            return False
+        return True
+
+    def _capture_loop(self):
+        frame_count = 0
+        start_time = time.time()
+        last_display_time = 0
+        display_interval = 1.0 / 30  # ~30 FPS
+
+        try:
+            with mss() as sct:
+                monitor = sct.monitors[1]
+                print(f"\nStarting background screen capture...")
+                print(f"Resolution: {monitor['width']} x {monitor['height']}")
+
+                while self.running:
+                    try:
+                        screenshot = sct.grab(monitor)
+                        frame = np.array(screenshot)
+                        frame = cv.cvtColor(frame, cv.COLOR_BGRA2BGR)
+
+                        with self.frame_lock:
+                            self.last_frame = frame
+
+                        current_time = time.time()
+
+                        # Push to display queue at ~30 FPS (main thread will consume)
+                        if current_time - last_display_time > display_interval:
+                            if not self.display_queue.empty():
+                                try:
+                                    self.display_queue.get_nowait()
+                                except Exception:
+                                    pass
+                            self.display_queue.put(frame)
+                            last_display_time = current_time
+
+                        # Push to process queue on interval
+                        if self.process_callback and (current_time - self.last_process_time) >= self.process_interval:
+                            if not self.process_queue.empty():
+                                try:
+                                    self.process_queue.get_nowait()
+                                except Exception:
+                                    pass
+                            self.process_queue.put(frame)
+                            self.last_process_time = current_time
+
+                            # Run callback in a separate thread so it doesn't block capture
+                            latest = self.process_queue.get()
+                            threading.Thread(
+                                target=self._run_callback,
+                                args=(latest,),
+                                daemon=True
+                            ).start()
+
+                        frame_count += 1
+                        time.sleep(0.01)
+
+                    except Exception as e:
+                        print(f"Error during capture: {str(e)}")
+                        time.sleep(0.1)
+                        continue
+
+        except Exception as e:
+            print(f"Critical error in capture: {str(e)}")
+            if "Permission denied" in str(e) or "screen recording" in str(e).lower():
+                print("\nScreen Recording permission denied. Check System Settings > Privacy.")
+        finally:
+            self.running = False
+            elapsed = time.time() - start_time
+            print(f"\nCapture thread finished. Captured {frame_count} frames.")
+            if elapsed > 0:
+                print(f"Total time: {elapsed:.2f}s, Average FPS: {frame_count/elapsed:.2f}")
+
+    def _run_callback(self, frame):
+        try:
+            self.process_callback(frame)
+        except Exception as e:
+            print(f"Error in process callback: {str(e)}")
+
+
+# Global instance for easy use
+screen_capture_instance = ScreenCapture()
+
+def screen_capture(process_callback=None, process_interval=1.0):
+    """
+    Starts screen capture in background with optional processing callback
+    """
+    return screen_capture_instance.start_capture(process_callback, process_interval)
+
+def stop_screen_capture():
+    """
+    Stops the background screen capture
+    """
+    return screen_capture_instance.stop_capture()
+
+def get_latest_frame():
+    """
+    Gets the latest captured frame
+    """
+    return screen_capture_instance.get_latest_frame()
