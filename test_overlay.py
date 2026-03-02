@@ -25,19 +25,8 @@ window_width, window_height = SCREEN_SIZE
 
 for d in data:
     box = data[d]["full"]
-    scaled_tl = (
-        int((box[0][0] / img_width) * window_width),
-        int((box[0][1] / img_height) * window_height)
-    )
-    scaled_br = (
-        int((box[1][0] / img_width) * window_width),
-        int((box[1][1] / img_height) * window_height)
-    )
-
+    scaled_tl,scaled_br = window.cvToQt(box[0],box[1],img_width,img_height)
     window.add_rectangle(scaled_tl, scaled_br, False)
 
-# for d in data:
-#     box = data[d]["full"]
-#     window.add_rectangle(box[0],box[1],False)
 show_imgs([img])
 sys.exit(app.exec())

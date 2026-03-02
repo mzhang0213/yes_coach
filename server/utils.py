@@ -156,7 +156,7 @@ class GameState:
 
         # Store original coordinates offset
         offset_x, offset_y = tl[0], tl[1]
-        
+
         # Template matching works best in grayscale or with matched channels
         img = self.img[tl[1]:br[1],tl[0]:br[0]]
         img = cv.cvtColor(img, cv.COLOR_BGR2GRAY)
@@ -473,3 +473,12 @@ class Overlay(QMainWindow):
     def showCanvas(self):
         """Show the canvas window"""
         self.show()  # Show the window
+
+    def cvToQt(self, tl:tuple[int,int], br:tuple[int,int], img_w:int, img_h:int)->tuple[tuple[int,int],tuple[int,int]]:
+        return (
+            int((tl[0] / img_w) * SCREEN_SIZE[0]),
+            int((tl[1] / img_h) * SCREEN_SIZE[1])
+        ), (
+            int((br[0] / img_w) * SCREEN_SIZE[0]),
+            int((br[1] / img_h) * SCREEN_SIZE[1])
+        )
