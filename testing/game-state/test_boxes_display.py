@@ -3,7 +3,7 @@ import cv2 as cv
 from server.utils import GameState, show_imgs
 
 
-img = cv.imread("./server/keys/test_1.png")
+img = cv.imread("./savetest.png")
 
 gs = GameState(img)
 data = gs.get_boxes()

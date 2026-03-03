@@ -35,6 +35,8 @@ FEATURES = {
     "map":((0.5,0.5),(1,1)),
     "playerstats":((0,0.5),(0.5,1))
 }
+BASE_RESOLUTION = (1512, 982) #my screen res FEATURES were captured at
+
 app = QApplication.instance() or QApplication(sys.argv)
 _screensize=app.primaryScreen().size()
 SCREEN_SIZE = _screensize.width(),_screensize.height()
@@ -126,6 +128,51 @@ def find_outliers_iqr(data: list) -> tuple[list, list]:
 
     return filtered_data, indices
 
+def ensure_fit(tl, br, target_w, target_h, img_w, img_h):
+    """
+    Expands the search area if it's smaller than the target image,
+    clamped to the actual image bounds.
+    """
+    x1, y1 = tl
+    x2, y2 = br
+
+    area_w = x2 - x1
+    area_h = y2 - y1
+
+    # Expand symmetrically if too small
+    if area_w < target_w:
+        diff = target_w - area_w + 2
+        if x2+diff>=img_w:
+            #if it were to send over the border, add first this side then add rest to other side
+            diff-=img_w-x2
+            x2=img_w
+            x1=max(0,x1-diff)
+        elif x1-diff<=0:
+            diff-=x1
+            x1=0
+            x2=min(img_w,x2+diff)
+        else:
+            #in the middle not touching borders
+            x1 = max(0, x1 - diff // 2)
+            x2 = min(img_w, x2 + diff // 2 + diff % 2)
+
+    if area_h < target_h:
+        diff = target_h - area_h + 2
+        if y2+diff>=img_h:
+            diff-=img_h-y2
+            y2=img_h
+            y1=max(0,y1-diff)
+        elif y1-diff<=0:
+            diff-=y1
+            y1=0
+            y2=min(img_h,y2+diff)
+        else:
+            y1 = max(0, y1 - diff // 2)
+            y2 = min(img_h, y2 + diff // 2 + diff % 2)
+
+    return (x1, y1), (x2, y2)
+
+
 def get_screen_coords(w:int, h:int, scale:tuple[tuple[float,float],tuple[float,float]])-> tuple[tuple[int, int], tuple[int, int]]:
     return (int(scale[0][0]*w),int(scale[0][1]*h)),(int(scale[1][0]*w),int(scale[1][1]*h))
 
@@ -162,12 +209,17 @@ class GameState:
         offset_x, offset_y = tl[0], tl[1]
 
         # Template matching works best in grayscale or with matched channels
+        #also ensure that the bounding box we are searching in will guarantee to fit the tgt
+
         img = self.img[tl[1]:br[1],tl[0]:br[0]]
         img = cv.cvtColor(img, cv.COLOR_BGR2GRAY)
         if len(target.shape) == 3:
             target = cv.cvtColor(target, cv.COLOR_BGR2GRAY)
 
         w, h = target.shape[::-1]
+
+        # cv.imwrite(f"img{tl[0]}.png", img)
+        # cv.imwrite(f"target{target.shape[1]}.png", target)
 
         # All the 6 methods for comparison in a list
         methods = ['TM_CCOEFF', 'TM_CCOEFF_NORMED', 'TM_CCORR',
@@ -248,15 +300,26 @@ class GameState:
         Analyzes the current game screen and returns structured data based on detected keys.
         """
         data = {}
+        img_h,img_w = self.img.shape[:2]
+        scale_x = SCREEN_SIZE[0] / BASE_RESOLUTION[0]
+        scale_y = SCREEN_SIZE[1] / BASE_RESOLUTION[1]
 
         for key_name in FEATURES:
             if key_name not in self.key_images:
                 continue
 
             curr_feature = self.key_images[key_name]
-            img_h,img_w = self.img.shape[:2]
-            feature_tl,feature_br = get_screen_coords(img_w,img_h,FEATURES[key_name])
-            tl, br = self.get_box(curr_feature, feature_tl, feature_br)
+
+            kh, kw = curr_feature.shape[:2]
+            new_kw = max(1, int(kw * scale_x))
+            new_kh = max(1, int(kh * scale_y))
+            scaled_feature = cv.resize(curr_feature, (new_kw, new_kh))
+            searcharea_tl,searcharea_br = get_screen_coords(img_w,img_h,FEATURES[key_name])
+            searcharea_tl, searcharea_br = ensure_fit(
+                searcharea_tl, searcharea_br, new_kw, new_kh, img_w, img_h
+            )
+
+            tl, br = self.get_box(scaled_feature, searcharea_tl, searcharea_br)
             feature = self.img[tl[1]:br[1], tl[0]:br[0]]
             fh,fw = feature.shape[:2]
 
@@ -510,7 +573,7 @@ class ScreenCapture:
         self.process_interval = process_interval
         self.running = True
 
-        self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self.capture_thread = threading.Thread(target=self.capturing, daemon=True)
         self.capture_thread.start()
         print("Screen capture started in background.")
         return True
@@ -529,26 +592,7 @@ class ScreenCapture:
         with self.frame_lock:
             return self.last_frame
 
-    def pump_display(self):
-        """
-        Call this repeatedly from the MAIN THREAD to show frames and handle GUI events.
-        Returns False if 'q' was pressed (signal to stop), True otherwise.
-        """
-        if not self.display_queue.empty():
-            try:
-                frame = self.display_queue.get_nowait()
-                cv.imshow('Live Screen Capture', frame)
-            except Exception:
-                pass
-
-        key = cv.waitKey(1)
-        if key & 0xFF == ord('q'):
-            print("'q' pressed, stopping capture...")
-            self.running = False
-            return False
-        return True
-
-    def _capture_loop(self):
+    def capturing(self):
         frame_count = 0
         start_time = time.time()
         last_display_time = 0
@@ -591,10 +635,10 @@ class ScreenCapture:
                             self.process_queue.put(frame)
                             self.last_process_time = current_time
 
-                            # Run callback in a separate thread so it doesn't block capture
+                            # Run callback in a separate thread
                             latest = self.process_queue.get()
                             threading.Thread(
-                                target=self._run_callback,
+                                target=self.callback,
                                 args=(latest,),
                                 daemon=True
                             ).start()
@@ -618,30 +662,28 @@ class ScreenCapture:
             if elapsed > 0:
                 print(f"Total time: {elapsed:.2f}s, Average FPS: {frame_count/elapsed:.2f}")
 
-    def _run_callback(self, frame):
+    def callback(self, frame):
         try:
             self.process_callback(frame)
         except Exception as e:
             print(f"Error in process callback: {str(e)}")
 
-
-# Global instance for easy use
-screen_capture_instance = ScreenCapture()
+SCREEN_CAP = ScreenCapture()
 
 def screen_capture(process_callback=None, process_interval=1.0):
     """
     Starts screen capture in background with optional processing callback
     """
-    return screen_capture_instance.start_capture(process_callback, process_interval)
+    return SCREEN_CAP.start_capture(process_callback, process_interval)
 
 def stop_screen_capture():
     """
     Stops the background screen capture
     """
-    return screen_capture_instance.stop_capture()
+    return SCREEN_CAP.stop_capture()
 
 def get_latest_frame():
     """
     Gets the latest captured frame
     """
-    return screen_capture_instance.get_latest_frame()
+    return SCREEN_CAP.get_latest_frame()

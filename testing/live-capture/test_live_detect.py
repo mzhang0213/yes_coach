@@ -6,57 +6,52 @@ from PyQt6.QtCore import QTimer
 from PyQt6.QtWidgets import QApplication
 
 from server.utils import GameState, show_imgs, Overlay, SCREEN_SIZE, screen_capture, stop_screen_capture, \
-    screen_capture_instance
+    SCREEN_CAP
 
 
 # #this image harvesting needs to be continuous
-# img = cv.imread("./server/keys/test_1.png")
-#
-# gs = GameState(img)
-# data = gs.get_boxes()
-#
-# # ret = []
-# # for k in data:
-# #     og = img.copy()
-# #     stats = data[k]
-# #     cv.rectangle(og, stats["full"][0], stats["full"][1], (0,0,255), thickness=10) #bgr
-# #     ret.append(og)
-# # show_imgs(ret)
-#
-# app = QApplication(sys.argv)
-# window = Overlay()
-# img_width, img_height = img.shape[1], img.shape[0]
-# window_width, window_height = SCREEN_SIZE
-#
-# for d in data:
-#     box = data[d]["full"]
-#     scaled_tl,scaled_br = window.cvToQt(box[0],box[1],img_width,img_height)
-#     window.add_rectangle(scaled_tl, scaled_br, False)
-#
-# show_imgs([img])
 # sys.exit(app.exec())
-
+first=True
 def process_frame(frame):
+    global first
     print(f"Processing frame at {time.strftime('%H:%M:%S')} - Shape: {frame.shape}")
     try:
         game_state = GameState(frame)
+        if first:
+            cv.imwrite("savetest.png", frame)
+        print(f"frame: {frame.shape[::-1]}")
         boxes = game_state.get_boxes()
         print(f"Detected {len(boxes)} game elements")
+        if first:
+            qt_app = QApplication(sys.argv)
+            window = Overlay()
+            img_width, img_height = frame.shape[1], frame.shape[0]
+            window_width, window_height = SCREEN_SIZE
+
+            for d in boxes:
+                box = boxes[d]["full"]
+                scaled_tl,scaled_br = window.cvToQt(box[0],box[1],img_width,img_height)
+                window.add_rectangle(scaled_tl, scaled_br, False)
+
+            show_imgs([boxes])
+            sys.exit(qt_app.exec())
+
+            first=False
     except Exception as e:
         print(f"Error processing frame: {str(e)}")
 
-
+#tick is used to detect wait key for both cv and pyqt
 def tick():
     """Called by QTimer on the main thread — safe for OpenCV GUI."""
-    if not screen_capture_instance.running:
+    if not SCREEN_CAP.running:
         app.quit()
         return
 
     # Drain the display queue and show the latest frame
     frame = None
-    while not screen_capture_instance.display_queue.empty():
+    while not SCREEN_CAP.display_queue.empty():
         try:
-            frame = screen_capture_instance.display_queue.get_nowait()
+            frame = SCREEN_CAP.display_queue.get_nowait()
         except Exception:
             break
 
