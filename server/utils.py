@@ -3,11 +3,8 @@ import numpy as np
 import os
 import pytesseract
 from matplotlib import pyplot as plt
-from PyQt6.QtWidgets import QApplication, QLabel, QMainWindow, QWidget
-from PyQt6.QtCore import Qt, QRect
-from PyQt6.QtGui import QPainter, QPen, QColor, QBrush
 import sys
-from PyQt6.QtWidgets import QMainWindow, QWidget
+from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget
 from PyQt6.QtCore import Qt, QRect
 from PyQt6.QtGui import QPainter, QPen, QColor, QBrush
 from mss import mss
@@ -16,30 +13,54 @@ import platform
 import threading
 from queue import Queue
 
+import logging
+
 class MDebug:
     def __init__(self):
         self.info = []
+        self.start = time.time()
+        logging.basicConfig(level=logging.INFO)
 
     def log_msg(self, msg):
-        self.info.append({"msg":msg})
+        self.info.append({"type":"message","message":str(msg), "time":time.time()-self.start})
 
     def log_img(self, img, name):
-        self.info.append({"name":name, "img":img})
+        self.info.append({"type":"image","name":str(name), "img":img, "time":time.time()-self.start})
 
+    def log_error(self, msg):
+        self.info.append({"type":"error","message":str(msg), "time":time.time()-self.start})
+
+    def dump(self, write_file=False):
+        ret = ""
+        os.makedirs("./logs/", exist_ok=True)
+        for msg in self.info:
+            if msg["type"]=="message":
+                fmt_msg = "INFO ("+str(msg["time"])+"): "+msg["message"]
+                logging.info(fmt_msg)
+                ret+=fmt_msg+"\n"
+            elif msg["type"]=="image":
+                cv.imwrite(msg["name"]+str(msg["time"]),msg["img"])
+            elif msg["type"]=="error":
+                fmt_msg = f"(ERROR {str(msg["time"])}) |  {msg["message"]}"
+                logging.error(fmt_msg)
+                ret+=fmt_msg+"\n"
+
+        if write_file:
+            with open(f"./logs/logs{round(time.time(), ndigits=5)}.txt", "w") as f:
+                f.write(ret)
 
 FEATURES = {
     #screen_feature: (tl,br)
-    "gamestats":((0.75,0),(1,0.2)),
+    "gamestats":((0.7,0),(1,0.5)),
     "hotbar":((0,0.5),(1,1)),
-    "items":((0.5,0.75),(0.9,1)),
     "map":((0.5,0.5),(1,1)),
     "playerstats":((0,0.5),(0.5,1))
 }
 BASE_RESOLUTION = (1512, 982) #my screen res FEATURES were captured at
-
 app = QApplication.instance() or QApplication(sys.argv)
 _screensize=app.primaryScreen().size()
 SCREEN_SIZE = _screensize.width(),_screensize.height()
+MLOG = MDebug()
 # KEYS = [
 #     {
 #         "name":"gamestats",
@@ -127,6 +148,28 @@ def find_outliers_iqr(data: list) -> tuple[list, list]:
                 indices.append(i)
 
     return filtered_data, indices
+
+def ensure_precision(data_x: list, data_y: list) -> bool:
+    thresh_factor = 0.2
+    x_thresh = SCREEN_SIZE[0]*thresh_factor
+    y_thresh = SCREEN_SIZE[1]*thresh_factor
+    '''
+    notes on threshold:
+    - not applying a hard pixel cap for std dev
+    - thresholds are based on screen size (ie x_thresh = within deviation 5% len of screen size)
+    images come in based on screen size of the user's screen, and thus the feature target images are also scaled, thus requiring this threshold to scale based on screen size.
+    '''
+    for pts in data_x:
+        dev = np.std(pts)
+        MLOG.log_msg("x: "+str(dev))
+        if dev > x_thresh:
+            return False
+    for pts in data_y:
+        dev = np.std(pts)
+        MLOG.log_msg("y: "+str(dev))
+        if dev > y_thresh:
+            return False
+    return True
 
 def ensure_fit(tl, br, target_w, target_h, img_w, img_h):
     """
@@ -263,12 +306,15 @@ class GameState:
         br_x_coords = [r[1][0] for r in results]
         br_y_coords = [r[1][1] for r in results]
 
+        if not ensure_precision([tl_x_coords,br_x_coords],[br_y_coords,tl_y_coords]):
+            MLOG.log_error("failed precision test")
+            return (0,0),(0,0)
+
         # Find outliers for each coordinate separately
         _, tl_x_outlier_indices = find_outliers_iqr(tl_x_coords)
         _, tl_y_outlier_indices = find_outliers_iqr(tl_y_coords)
         _, br_x_outlier_indices = find_outliers_iqr(br_x_coords)
         _, br_y_outlier_indices = find_outliers_iqr(br_y_coords)
-
 
         pruned = [] #this is just the results tuples pruned for outliers
         outlier_indicies = set(tl_x_outlier_indices + tl_y_outlier_indices +
@@ -355,6 +401,8 @@ class GameState:
     def display_boxes(self):
         boxes = self.get_boxes()
         for key in FEATURES:
+            if boxes[key] is None:
+                continue
             og = self.img.copy()
             cv.rectangle(og, boxes[key]["full"][0], boxes[key]["full"][1], (0,255,0))
             cv.imshow(key, og)
@@ -550,6 +598,7 @@ class Overlay(QMainWindow):
             int((br[1] / img_h) * SCREEN_SIZE[1])
         )
 
+
 DYDX = []
 
 class ScreenCapture:
@@ -561,8 +610,10 @@ class ScreenCapture:
         self.process_callback = None
         self.process_interval = 1.0
         self.last_process_time = 0
-        self.process_queue = Queue(maxsize=1)  # For processing callback
-        self.display_queue = Queue(maxsize=1)  # For main-thread display
+        self.latest_display_frame = None
+        self.latest_process_frame = None
+        self.display_lock = threading.Lock()
+        self.process_lock = threading.Lock()
 
     def start_capture(self, process_callback=None, process_interval=1.0):
         if self.running:
@@ -588,9 +639,12 @@ class ScreenCapture:
         print("Screen capture stopped.")
         return True
 
-    def get_latest_frame(self):
-        with self.frame_lock:
-            return self.last_frame
+    def get_latest_display_frame(self):
+        """Get latest frame for display (thread-safe)"""
+        with self.display_lock:
+            frame = self.latest_display_frame
+            self.latest_display_frame = None
+            return frame
 
     def capturing(self):
         frame_count = 0
@@ -615,31 +669,22 @@ class ScreenCapture:
 
                         current_time = time.time()
 
-                        # Push to display queue at ~30 FPS (main thread will consume)
+                        # Update display frame at ~30 FPS (main thread will consume)
                         if current_time - last_display_time > display_interval:
-                            if not self.display_queue.empty():
-                                try:
-                                    self.display_queue.get_nowait()
-                                except Exception:
-                                    pass
-                            self.display_queue.put(frame)
+                            with self.display_lock:
+                                self.latest_display_frame = frame
                             last_display_time = current_time
 
-                        # Push to process queue on interval
+                        # Update process frame on interval
                         if self.process_callback and (current_time - self.last_process_time) >= self.process_interval:
-                            if not self.process_queue.empty():
-                                try:
-                                    self.process_queue.get_nowait()
-                                except Exception:
-                                    pass
-                            self.process_queue.put(frame)
+                            with self.process_lock:
+                                self.latest_process_frame = frame
                             self.last_process_time = current_time
 
                             # Run callback in a separate thread
-                            latest = self.process_queue.get()
                             threading.Thread(
                                 target=self.callback,
-                                args=(latest,),
+                                args=(frame,),
                                 daemon=True
                             ).start()
 

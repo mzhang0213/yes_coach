@@ -5,6 +5,7 @@ This application creates a transparent overlay that allows users to select
 a region of the screen for capture without interfering with underlying applications.
 """
 
+import queue
 import cv2
 import numpy as np
 import tkinter as tk
@@ -26,6 +27,9 @@ class ScreenRegionSelector:
         self.current_point = None
         self.selected_region = None
         self.sct = mss()
+        self.frame_queue = queue.Queue(maxsize=2)
+        self.capture_window = None
+        self.capture_label = None
         
         # Get screen dimensions
         self.screen_width = self.sct.monitors[0]['width']  # Combined monitor width
@@ -79,7 +83,7 @@ class ScreenRegionSelector:
             self.selection_window = tk.Canvas(
                 self.overlay,
                 highlightthickness=0,
-                bg='',
+                bg='white',
                 bd=0
             )
             self.selection_window.place(x=0, y=0, width=self.screen_width, height=self.screen_height)
@@ -156,36 +160,66 @@ class ScreenRegionSelector:
         if not self.selected_region:
             print("No region selected!")
             return
-        
+
         print(f"Starting capture of region: {self.selected_region}")
-        
-        # Start capture in a separate thread to not block
-        capture_thread = threading.Thread(target=self.capture_loop)
-        capture_thread.daemon = True
+
+        # Create a tkinter window on the main thread for display
+        self.capture_window = tk.Toplevel(self.root)
+        self.capture_window.title("Selected Region Capture - Press Q to quit")
+        self.capture_window.bind('<q>', lambda e: self._stop_capture())
+        self.capture_window.bind('<Q>', lambda e: self._stop_capture())
+        self.capture_window.protocol("WM_DELETE_WINDOW", self._stop_capture)
+        self.capture_label = tk.Label(self.capture_window)
+        self.capture_label.pack()
+
+        # Start capture in a separate thread
+        capture_thread = threading.Thread(target=self.capture_loop, daemon=True)
         capture_thread.start()
-    
+
+        # Poll the frame queue on the main thread
+        self._poll_frames()
+
+    def _stop_capture(self):
+        """Stop capture and close windows"""
+        # Signal the capture loop to stop by poisoning the queue
+        try:
+            self.frame_queue.put_nowait(None)
+        except queue.Full:
+            pass
+        if self.capture_window:
+            self.capture_window.destroy()
+            self.capture_window = None
+        self.root.quit()
+
+    def _poll_frames(self):
+        """Poll frame queue and update display — runs on main thread via root.after"""
+        if self.capture_window is None:
+            return
+        try:
+            frame = self.frame_queue.get_nowait()
+            if frame is None:
+                return  # sentinel: stop polling
+            img = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            imgtk = ImageTk.PhotoImage(image=img)
+            self.capture_label.imgtk = imgtk  # keep reference
+            self.capture_label.config(image=imgtk)
+        except queue.Empty:
+            pass
+        self.root.after(16, self._poll_frames)  # ~60fps
+
     def capture_loop(self):
-        """Main capture loop"""
+        """Main capture loop — runs in background thread, no GUI calls"""
         try:
             while True:
-                # Capture the selected region
                 screenshot = self.sct.grab(self.selected_region)
-                
-                # Convert to numpy array and BGR format
                 frame = np.array(screenshot)
                 frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
-                
-                # Display the captured region
-                cv2.imshow('Selected Region Capture - Press Q to quit', frame)
-                
-                # Exit on 'q' key press
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
-        
-        except KeyboardInterrupt:
-            print("Capture interrupted")
-        finally:
-            cv2.destroyAllWindows()
+                try:
+                    self.frame_queue.put(frame, timeout=0.1)
+                except queue.Full:
+                    pass  # drop frame if display can't keep up
+        except Exception as e:
+            print(f"Capture error: {e}")
     
     def start_selection(self):
         """Start the region selection process"""
