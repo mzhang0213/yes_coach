@@ -247,20 +247,3 @@ class ScreenRegionSelector:
             # Window might already be destroyed
             pass
 
-
-def main():
-    print("Screen Region Selector")
-    print("Instructions:")
-    print("1. A transparent overlay will appear over your screen")
-    print("2. Click and drag to select a region")
-    print("3. The selected region will be captured in real-time")
-    print("4. Press 'q' in the capture window to stop")
-    print("5. Press 'ESC' during selection to cancel")
-    print()
-    
-    selector = ScreenRegionSelector()
-    selector.start_selection()
-
-
-if __name__ == "__main__":
-    main()

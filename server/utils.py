@@ -15,6 +15,9 @@ from queue import Queue
 
 import logging
 
+from server.resources.region_menu import RegionMenu
+
+
 class MDebug:
     def __init__(self):
         self.info = []
@@ -458,25 +461,19 @@ class Overlay(QMainWindow):
 
         # Draw each rectangle using TL and BR points
         for rect_coords in self.rectangles:
-            top_left_x, top_left_y, bottom_right_x, bottom_right_y, filled = rect_coords
+            top_left_x, top_left_y, bottom_right_x, bottom_right_y, filled, color = rect_coords
+            r, g, b = color
 
-            # Calculate width and height from TL and BR points
             width = bottom_right_x - top_left_x
             height = bottom_right_y - top_left_y
-
-            # Create QRect from top-left point and dimensions
             rect = QRect(top_left_x, top_left_y, width, height)
 
-            # Set pen for drawing the rectangle
-            painter.setPen(QPen(QColor(255, 0, 0), 3))  # Red border, 3px thick
-
-            # Set brush based on fill option
+            painter.setPen(QPen(QColor(r, g, b), 3))
             if filled:
-                painter.setBrush(QBrush(QColor(255, 0, 0, 50)))  # Semi-transparent red fill
+                painter.setBrush(QBrush(QColor(r, g, b, 50)))
             else:
-                painter.setBrush(QBrush())  # No fill
+                painter.setBrush(QBrush())
 
-            # Draw the rectangle
             painter.drawRect(rect)
 
         # Draw each circle
@@ -537,17 +534,18 @@ class Overlay(QMainWindow):
         painter.drawLine(int(end_x), int(end_y), int(x1), int(y1))
         painter.drawLine(int(end_x), int(end_y), int(x2), int(y2))
 
-    def add_rectangle(self, top_left, bottom_right, filled=True):
+    def add_rectangle(self, top_left, bottom_right, filled=True, color=(255, 0, 0)):
         """Add a new rectangle given top-left and bottom-right points
 
         Args:
             top_left: tuple (x, y) representing top-left corner
             bottom_right: tuple (x, y) representing bottom-right corner
             filled: bool indicating whether to fill the rectangle
+            color: tuple (r, g, b) border/fill color
         """
         tl_x, tl_y = top_left
         br_x, br_y = bottom_right
-        self.rectangles.append((tl_x, tl_y, br_x, br_y, filled))
+        self.rectangles.append((tl_x, tl_y, br_x, br_y, filled, color))
         self.update()  # Trigger repaint
 
     def add_circle(self, center, radius, filled=True):
@@ -732,3 +730,22 @@ def get_latest_frame():
     Gets the latest captured frame
     """
     return SCREEN_CAP.get_latest_frame()
+
+
+
+def setup_screen(overlay_agent: Overlay) -> dict:
+    """
+    Init screen cap areas by letting user pick regions via menu, then draw them on the overlay.
+    :param overlay_agent: the PyQt Overlay window
+    :return: dict of name -> {left, top, width, height}
+    """
+    regions = RegionMenu(list(FEATURES.keys())).run()
+
+    # Draw each selected region on the overlay in its assigned color
+    overlay_agent.clearCanvas()
+    for region in regions.values():
+        tl = (region['left'], region['top'])
+        br = (region['left'] + region['width'], region['top'] + region['height'])
+        overlay_agent.add_rectangle(tl, br, False, color=region.get('color', (255, 0, 0)))
+
+    return regions
