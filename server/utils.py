@@ -54,12 +54,83 @@ class MDebug:
 
 FEATURES = {
     #screen_feature: (tl,br)
-    "gamestats":((0.7,0),(1,0.5)),
-    "hotbar":((0,0.5),(1,1)),
-    "map":((0.5,0.5),(1,1)),
-    "playerstats":((0,0.5),(0.5,1))
+    "gamestats":  ((0.7,  0.0), (1.0,  0.5 )),
+    "hotbar":     ((0.0,  0.5), (1.0,  1.0 )),
+    "map":        ((0.5,  0.5), (1.0,  1.0 )),
+    "playerstats":((0.0,  0.5), (0.5,  1.0 )),
+    "tab_menu":   ((0.05, 0.0), (0.95, 0.85)),  # full-screen overlay (held Tab)
 }
 BASE_RESOLUTION = (1512, 982) #my screen res FEATURES were captured at
+
+# Relative sub-regions for each readable value within a feature crop.
+# Format: name -> { value_name: ((rx1, ry1), (rx2, ry2)) }
+# All coords are fractions of the crop's (width, height) — tune from captures.
+
+def _tab_menu_values() -> dict[str, tuple]:
+    """
+    Generate relative cell positions for the LoL tab scoreboard grid.
+    Layout: game_time header | 5 blue rows | 5 red rows
+    Columns: name, kda, cs, gold  (x anchors shared across all rows)
+    """
+    # Column x-ranges within the tab crop
+    cols = {
+        "name": (0.18, 0.38),
+        "kda":  (0.40, 0.52),
+        "cs":   (0.52, 0.59),
+        "gold": (0.60, 0.68),
+    }
+    # Row y-ranges: blue team rows then red team rows
+    # Each team occupies roughly half the crop; header ~7% at top
+    row_h = 0.088  # height of one player row
+    blue_y0, red_y0 = 0.10, 0.58
+    blue_rows = [(blue_y0 + i * row_h, blue_y0 + (i + 1) * row_h) for i in range(5)]
+    red_rows  = [(red_y0  + i * row_h, red_y0  + (i + 1) * row_h) for i in range(5)]
+
+    values: dict[str, tuple] = {
+        "game_time": ((0.38, 0.00), (0.62, 0.07)),
+    }
+    for team, rows in (("blue", blue_rows), ("red", red_rows)):
+        for i, (y1, y2) in enumerate(rows, 1):
+            for stat, (x1, x2) in cols.items():
+                values[f"{team}{i}_{stat}"] = ((x1, y1), (x2, y2))
+    return values
+
+
+FEATURE_VALUES: dict[str, dict[str, tuple]] = {
+
+    # Top HUD bar: timer (center), team gold/kills (sides)
+    "gamestats": {
+        "timer":         ((0.38, 0.00), (0.62, 1.00)),  # game clock, center
+        "blue_kills":    ((0.10, 0.00), (0.30, 1.00)),  # blue team kill count
+        "red_kills":     ((0.70, 0.00), (0.90, 1.00)),  # red team kill count
+        "blue_gold":     ((0.05, 0.00), (0.25, 1.00)),  # blue team total gold
+        "red_gold":      ((0.75, 0.00), (0.95, 1.00)),  # red team total gold
+    },
+
+    # Bottom-left player HUD: health/mana bars, level badge, XP bar
+    "playerstats": {
+        "health":        ((0.08, 0.55), (0.55, 0.68)),  # HP number on health bar
+        "mana":          ((0.08, 0.72), (0.55, 0.84)),  # MP number on mana bar
+        "level":         ((0.00, 0.45), (0.10, 0.60)),  # champion level badge
+        "xp_bar":        ((0.00, 0.88), (1.00, 1.00)),  # XP progress (numeric if shown)
+    },
+
+    # Bottom-center hotbar: summoner spell CDs, gold, CS, KDA
+    "hotbar": {
+        "gold":          ((0.42, 0.72), (0.58, 0.90)),  # current gold
+        "cs":            ((0.28, 0.72), (0.42, 0.90)),  # creep score
+        "kda":           ((0.38, 0.10), (0.62, 0.30)),  # K/D/A line
+        "spell1_cd":     ((0.03, 0.30), (0.13, 0.55)),  # summoner spell 1 cooldown
+        "spell2_cd":     ((0.03, 0.55), (0.13, 0.80)),  # summoner spell 2 cooldown
+    },
+
+    # Minimap: no OCR targets (visual only)
+    "map": {},
+
+    # Tab scoreboard: game_time + blue1..5 / red1..5 × {name, kda, cs, gold}
+    "tab_menu": _tab_menu_values(),
+}
+
 app = QApplication.instance() or QApplication(sys.argv)
 _screensize=app.primaryScreen().size()
 SCREEN_SIZE = _screensize.width(),_screensize.height()
@@ -749,3 +820,62 @@ def setup_screen(overlay_agent: Overlay) -> dict:
         overlay_agent.add_rectangle(tl, br, False, color=region.get('color', (255, 0, 0)))
 
     return regions
+
+
+
+
+#READ VALUES
+
+def get_value_crop(feature_crop: np.ndarray, feature_name: str, value_name: str) -> np.ndarray | None:
+    """Return the sub-crop for a named value within a feature crop, ready for OCR.
+
+    Args:
+        feature_crop: the already-cropped feature image (BGR numpy array)
+        feature_name: key in FEATURE_VALUES  e.g. "gamestats"
+        value_name:   key within that feature e.g. "timer"
+    Returns:
+        cropped numpy array, or None if the name isn't found / crop is empty
+    """
+    spec = FEATURE_VALUES.get(feature_name, {}).get(value_name)
+    if spec is None:
+        return None
+    h, w = feature_crop.shape[:2]
+    (rx1, ry1), (rx2, ry2) = spec
+    crop = feature_crop[int(ry1 * h):int(ry2 * h), int(rx1 * w):int(rx2 * w)]
+    return crop if crop.size > 0 else None
+
+
+def read_value(feature_crop: np.ndarray, feature_name: str, value_name: str,
+               digits_only: bool = False) -> str:
+    """OCR a named value from a feature crop.
+
+    Args:
+        feature_crop: the already-cropped feature image
+        feature_name: key in FEATURE_VALUES
+        value_name:   key within that feature
+        digits_only:  if True, restrict tesseract to digits (for numeric-only fields)
+    Returns:
+        stripped OCR string, or "" on failure
+    """
+    crop = get_value_crop(feature_crop, feature_name, value_name)
+    if crop is None:
+        return ""
+    gray = cv.cvtColor(crop, cv.COLOR_BGR2GRAY)
+    config = '--psm 7 --oem 3' + (' -c tessedit_char_whitelist=0123456789:/' if digits_only else '')
+    try:
+        return pytesseract.image_to_string(gray, config=config).strip()
+    except Exception:
+        return ""
+
+
+def read_all_values(feature_crop: np.ndarray, feature_name: str,
+                    digits_only: bool = False) -> dict[str, str]:
+    """OCR every defined value for a feature at once.
+
+    Returns:
+        dict of value_name -> OCR string
+    """
+    return {
+        name: read_value(feature_crop, feature_name, name, digits_only=digits_only)
+        for name in FEATURE_VALUES.get(feature_name, {})
+    }
