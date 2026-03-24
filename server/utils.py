@@ -16,6 +16,7 @@ from queue import Queue
 import logging
 
 from server.resources.region_menu import RegionMenu
+import requests
 
 
 class MDebug:
@@ -879,3 +880,5 @@ def read_all_values(feature_crop: np.ndarray, feature_name: str,
         name: read_value(feature_crop, feature_name, name, digits_only=digits_only)
         for name in FEATURE_VALUES.get(feature_name, {})
     }
+
+

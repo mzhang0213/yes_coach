@@ -3,3 +3,4 @@ numpy>=1.19.0
 mss>=6.1.0
 pillow>=8.0.0
 pyqt6
+requests
