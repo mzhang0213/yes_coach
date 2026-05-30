@@ -4,9 +4,11 @@ import os
 import pytesseract
 from matplotlib import pyplot as plt
 import sys
-from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget
-from PyQt6.QtCore import Qt, QRect
-from PyQt6.QtGui import QPainter, QPen, QColor, QBrush
+from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget,
+                              QLabel, QLineEdit, QPushButton, QVBoxLayout)
+from PyQt6.QtCore import Qt, QRect, QRectF, QEventLoop
+from PyQt6.QtGui import (QPainter, QPen, QColor, QBrush, QFont,
+                          QLinearGradient, QRadialGradient, QPainterPath, QPixmap)
 from mss import mss
 import time
 import platform
@@ -136,356 +138,138 @@ app = QApplication.instance() or QApplication(sys.argv)
 _screensize=app.primaryScreen().size()
 SCREEN_SIZE = _screensize.width(),_screensize.height()
 MLOG = MDebug()
-# KEYS = [
-#     {
-#         "name":"gamestats",
-#         "box":((0.75,0),(1,0.2))
-#     },
-#     {
-#         "name":"hotbar",
-#         "box":((0,0.5),(1,1))
-#     },
-#     {
-#         "name":"items",
-#         "box":((0.5,0.75),(0.9,1))
-#     },
-#     {
-#         "name":"map",
-#         "box":((0.5,0.5),(1,1))
-#     },
-#     {
-#         "name":"playerstats",
-#         "box":((0,0.5),(0.5,1))
-#     }
-# ]
-
-def show_imgs(_img):
-    """
-    show cv images, auto use quit with Q
-    BLOCKS INPUT AND EXECUTION
-    :param _img: LIST OF IMAGES
-    """
-    while True:
-        for i,_ in enumerate(_img):
-            cv.imshow(f'img{str(i)}', _)
-
-        if cv.waitKey(1) & 0xFF == ord('q'):
-            break
-
-def find_outliers_iqr(data: list) -> tuple[list, list]:
-    """
-    Find outliers using the Interquartile Range (IQR) method.
-
-    :param data: List of numeric values
-    :return: (filtered_data, indices)
-    """
-    data = np.array(data)
-    if len(data) == 0:
-        return [], []
-
-    # Convert to numpy array
-    arr_data = np.array(data)
-
-    # Handle both scalar and coordinate data
-    if arr_data.ndim == 1:  # 1D array (scalar values)
-        Q1 = np.percentile(arr_data, 25)
-        Q3 = np.percentile(arr_data, 75)
-        IQR = Q3 - Q1
-        lower_bound = Q1 - 1.5 * IQR
-        upper_bound = Q3 + 1.5 * IQR
-
-        filtered_data = []
-        indices = []
-        for i, val in enumerate(arr_data):
-            if lower_bound <= val <= upper_bound:
-                filtered_data.append(data[i])  # Use original data to preserve type
-                indices.append(i)
-    else:  # 2D array (coordinates or multi-dimensional data)
-        # Process each dimension separately
-        filtered_data = []
-        indices = []
-        for i, coord in enumerate(arr_data):
-            coord_valid = True
-            for dim_idx in range(len(coord)):
-                dim_data = arr_data[:, dim_idx]
-                Q1 = np.percentile(dim_data, 25)
-                Q3 = np.percentile(dim_data, 75)
-                IQR = Q3 - Q1
-                lower_bound = Q1 - 1.5 * IQR
-                upper_bound = Q3 + 1.5 * IQR
-
-                if not (lower_bound <= coord[dim_idx] <= upper_bound):
-                    coord_valid = False
-                    break
-
-            if coord_valid:
-                filtered_data.append(data[i])  # Use original data to preserve type
-                indices.append(i)
-
-    return filtered_data, indices
-
-def ensure_precision(data_x: list, data_y: list) -> bool:
-    thresh_factor = 0.2
-    x_thresh = SCREEN_SIZE[0]*thresh_factor
-    y_thresh = SCREEN_SIZE[1]*thresh_factor
-    '''
-    notes on threshold:
-    - not applying a hard pixel cap for std dev
-    - thresholds are based on screen size (ie x_thresh = within deviation 5% len of screen size)
-    images come in based on screen size of the user's screen, and thus the feature target images are also scaled, thus requiring this threshold to scale based on screen size.
-    '''
-    for pts in data_x:
-        dev = np.std(pts)
-        MLOG.log_msg("x: "+str(dev))
-        if dev > x_thresh:
-            return False
-    for pts in data_y:
-        dev = np.std(pts)
-        MLOG.log_msg("y: "+str(dev))
-        if dev > y_thresh:
-            return False
-    return True
-
-def ensure_fit(tl, br, target_w, target_h, img_w, img_h):
-    """
-    Expands the search area if it's smaller than the target image,
-    clamped to the actual image bounds.
-    """
-    x1, y1 = tl
-    x2, y2 = br
-
-    area_w = x2 - x1
-    area_h = y2 - y1
-
-    # Expand symmetrically if too small
-    if area_w < target_w:
-        diff = target_w - area_w + 2
-        if x2+diff>=img_w:
-            #if it were to send over the border, add first this side then add rest to other side
-            diff-=img_w-x2
-            x2=img_w
-            x1=max(0,x1-diff)
-        elif x1-diff<=0:
-            diff-=x1
-            x1=0
-            x2=min(img_w,x2+diff)
-        else:
-            #in the middle not touching borders
-            x1 = max(0, x1 - diff // 2)
-            x2 = min(img_w, x2 + diff // 2 + diff % 2)
-
-    if area_h < target_h:
-        diff = target_h - area_h + 2
-        if y2+diff>=img_h:
-            diff-=img_h-y2
-            y2=img_h
-            y1=max(0,y1-diff)
-        elif y1-diff<=0:
-            diff-=y1
-            y1=0
-            y2=min(img_h,y2+diff)
-        else:
-            y1 = max(0, y1 - diff // 2)
-            y2 = min(img_h, y2 + diff // 2 + diff % 2)
-
-    return (x1, y1), (x2, y2)
 
 
-def get_screen_coords(w:int, h:int, scale:tuple[tuple[float,float],tuple[float,float]])-> tuple[tuple[int, int], tuple[int, int]]:
-    return (int(scale[0][0]*w),int(scale[0][1]*h)),(int(scale[1][0]*w),int(scale[1][1]*h))
+class ButtonPlacer(QWidget):
+    """Dimmed full-screen overlay with a white crosshair. Click to place, ESC to cancel."""
 
-class GameState:
+    def __init__(self):
+        super().__init__()
+        self.mouse_pos = None
+        self.selected_position = None
+        self._loop = None
 
-    def __init__(self, img):
-        self.img = img #the frame of the game state to analyze
-        self.key_images = {}
-        #todo: rework this cuz shouldn't be duplicated for each game state
-        keys_dir = os.path.join(os.path.dirname(__file__), 'keys')
-        for key in FEATURES:
-            path = os.path.join(keys_dir, f"{key}.png")
-            if os.path.exists(path):
-                self.key_images[key] = cv.imread(path)
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint |
+            Qt.WindowType.WindowStaysOnTopHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.BlankCursor)
 
-    def get_box(self, target, tl:tuple[int,int], br:tuple[int,int]) -> tuple[tuple[int, int], tuple[int, int]]:
-        """
-        Retrieves the bounding box on the screen containing target (key image).
-        :param br:
-        :param tl:
-        :param target: target image as np.array image
-        :return: bounding box - (top left coordinate, bottom right coordinate)
-        """
-        #Source: https://docs.opencv.org/4.x/d4/dc6/tutorial_py_template_matching.html
-        #(note minor edits made)
-        assert self.img is not None, "this game state's img could not be read"
-        assert target is not None, "target image is None"
-        if tl == (-1, -1):
-            tl = (0,0)
-        if br == (-1, -1):
-            br = tuple(self.img.shape[::-1])
+        screen = app.primaryScreen().geometry()
+        self.setGeometry(screen)
 
-        # Store original coordinates offset
-        offset_x, offset_y = tl[0], tl[1]
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        # Template matching works best in grayscale or with matched channels
-        #also ensure that the bounding box we are searching in will guarantee to fit the tgt
+        # dim
+        painter.fillRect(self.rect(), QColor(0, 0, 0, 100))
 
-        img = self.img[tl[1]:br[1],tl[0]:br[0]]
-        img = cv.cvtColor(img, cv.COLOR_BGR2GRAY)
-        if len(target.shape) == 3:
-            target = cv.cvtColor(target, cv.COLOR_BGR2GRAY)
+        if self.mouse_pos:
+            mx, my = self.mouse_pos.x(), self.mouse_pos.y()
+            arm = 8
 
-        w, h = target.shape[::-1]
+            # white X crosshair
+            pen = QPen(QColor(255, 255, 255), 2)
+            painter.setPen(pen)
+            painter.drawLine(mx - arm, my - arm, mx + arm, my + arm)
+            painter.drawLine(mx - arm, my + arm, mx + arm, my - arm)
 
-        # cv.imwrite(f"img{tl[0]}.png", img)
-        # cv.imwrite(f"target{target.shape[1]}.png", target)
+        # instruction label
+        text = "Click to place button.  ESC to cancel."
+        font = QFont('Arial', 13)
+        font.setBold(True)
+        painter.setFont(font)
+        fm = painter.fontMetrics()
+        tw = fm.horizontalAdvance(text)
+        th = fm.height()
+        pad = 10
+        bx = (self.width() - tw) // 2 - pad
+        by = 40
+        painter.fillRect(bx, by, tw + pad * 2, th + pad * 2, QColor(255, 255, 255, 230))
+        painter.setPen(QPen(QColor(0, 0, 0), 1))
+        painter.drawRect(bx, by, tw + pad * 2, th + pad * 2)
+        painter.setPen(Qt.GlobalColor.black)
+        painter.drawText(bx + pad, by + pad + fm.ascent(), text)
 
-        # All the 6 methods for comparison in a list
-        methods = ['TM_CCOEFF', 'TM_CCOEFF_NORMED', 'TM_CCORR',
-                   'TM_CCORR_NORMED', 'TM_SQDIFF', 'TM_SQDIFF_NORMED']
+        painter.end()
 
-        results = []
+    def mouseMoveEvent(self, event):
+        self.mouse_pos = event.pos()
+        self.update()
 
-        for m in methods:
-            method = getattr(cv, m)
-            # Apply template Matching
-            res = cv.matchTemplate(img,target,method)
-            min_val, max_val, min_loc, max_loc = cv.minMaxLoc(res)
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.selected_position = {
+                'x': event.pos().x() / SCREEN_SIZE[0],
+                'y': event.pos().y() / SCREEN_SIZE[1],
+            }
+            self.close()
 
-            # If the method is TM_SQDIFF or TM_SQDIFF_NORMED, take minimum
-            if method in [cv.TM_SQDIFF, cv.TM_SQDIFF_NORMED]:
-                top_left = int(min_loc[0]), int(min_loc[1])
-            else:
-                top_left = int(max_loc[0]), int(max_loc[1])
-            bottom_right = int(top_left[0] + w), int(top_left[1] + h)
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self.close()
 
-            # Adjust coordinates back to original image space
-            top_left = (top_left[0] + offset_x, top_left[1] + offset_y)
-            bottom_right = (bottom_right[0] + offset_x, bottom_right[1] + offset_y)
+    def closeEvent(self, event):
+        if self._loop and self._loop.isRunning():
+            self._loop.quit()
+        super().closeEvent(event)
 
-            curr_box = top_left,bottom_right
-            results.append(curr_box)
-
-            # cv.rectangle(img,top_left, bottom_right, 255, 2)
-
-            # plt.subplot(121),plt.imshow(res,cmap = 'gray')
-            # plt.title('Matching Result'), plt.xticks([]), plt.yticks([])
-            # plt.subplot(122),plt.imshow(img,cmap = 'gray')
-            # plt.title('Detected Point'), plt.xticks([]), plt.yticks([])
-            # plt.suptitle(meth)
-            #
-            # plt.show()
-
-        # Extract x and y coordinates separately for outlier detection
-        tl_x_coords = [r[0][0] for r in results]
-        tl_y_coords = [r[0][1] for r in results]
-        br_x_coords = [r[1][0] for r in results]
-        br_y_coords = [r[1][1] for r in results]
-
-        if not ensure_precision([tl_x_coords,br_x_coords],[br_y_coords,tl_y_coords]):
-            MLOG.log_error("failed precision test")
-            return (0,0),(0,0)
-
-        # Find outliers for each coordinate separately
-        _, tl_x_outlier_indices = find_outliers_iqr(tl_x_coords)
-        _, tl_y_outlier_indices = find_outliers_iqr(tl_y_coords)
-        _, br_x_outlier_indices = find_outliers_iqr(br_x_coords)
-        _, br_y_outlier_indices = find_outliers_iqr(br_y_coords)
-
-        pruned = [] #this is just the results tuples pruned for outliers
-        outlier_indicies = set(tl_x_outlier_indices + tl_y_outlier_indices +
-                               br_x_outlier_indices + br_y_outlier_indices)
-        for i in range(len(results)):
-            if i not in outlier_indicies:
-                pruned.append(results[i])
-
-        if not pruned:
-            #fallback if too few results
-            return results[0] #TODO: always chooses the first matching
-
-        # Calculate mean of pruned results
-        final_tl = (round(np.mean([r[0][0] for r in pruned])),
-                   int(np.mean([r[0][1] for r in pruned])))
-        final_br = (int(np.mean([r[1][0] for r in pruned])),
-                   int(np.mean([r[1][1] for r in pruned])))
-
-        return final_tl, final_br
+    def pick(self) -> dict | None:
+        """Block until click. Returns {'x': float, 'y': float} or None."""
+        self._loop = QEventLoop()
+        self.show()
+        self._loop.exec()
+        return self.selected_position
 
 
-    # def get_boxes(self):
-    #     return {
-    #
-    #     }
+class PromptWindow(QWidget):
+    """Small input window for custom user questions."""
 
-    def get_boxes(self):
-        """
-        Analyzes the current game screen and returns structured data based on detected keys.
-        """
-        data = {}
-        img_h,img_w = self.img.shape[:2]
-        scale_x = SCREEN_SIZE[0] / BASE_RESOLUTION[0]
-        scale_y = SCREEN_SIZE[1] / BASE_RESOLUTION[1]
+    def __init__(self, callback=None):
+        super().__init__()
+        self.callback = callback
+        self.setWindowTitle("Ask Coach")
+        self.setFixedSize(350, 130)
+        self.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint)
 
-        for key_name in FEATURES:
-            if key_name not in self.key_images:
-                continue
+        layout = QVBoxLayout()
 
-            curr_feature = self.key_images[key_name]
+        label = QLabel("Ask your question:")
+        label.setFont(QFont('Arial', 12, QFont.Weight.Bold))
+        layout.addWidget(label)
 
-            kh, kw = curr_feature.shape[:2]
-            new_kw = max(1, int(kw * scale_x))
-            new_kh = max(1, int(kh * scale_y))
-            scaled_feature = cv.resize(curr_feature, (new_kw, new_kh))
-            searcharea_tl,searcharea_br = get_screen_coords(img_w,img_h,FEATURES[key_name])
-            searcharea_tl, searcharea_br = ensure_fit(
-                searcharea_tl, searcharea_br, new_kw, new_kh, img_w, img_h
-            )
+        self.text_input = QLineEdit()
+        self.text_input.setPlaceholderText("e.g. Should I take dragon or push mid?")
+        self.text_input.returnPressed.connect(self._submit)
+        layout.addWidget(self.text_input)
 
-            tl, br = self.get_box(scaled_feature, searcharea_tl, searcharea_br)
-            feature = self.img[tl[1]:br[1], tl[0]:br[0]]
-            fh,fw = feature.shape[:2]
+        submit_btn = QPushButton("Ask!")
+        submit_btn.clicked.connect(self._submit)
+        layout.addWidget(submit_btn)
 
-            if key_name == "gamestats":
-                # KDA: approx 250 to 400
-                kda_box = (int(0.42 * fw),(0.68 * fw)),(0,fh)
-                # CS: approx 450 to 520
-                cs_box = (int(0.76 * fw),int(0.88 * fw)),(0,fh)
-                # Clock: approx 530 to 590
-                clock_box = (int(0.9 * fw),fw),(0,fh)
-                # Score: approx 0 to 150
-                score_box = (0,int(0.25 * fw)),(0,fh)
+        self.setLayout(layout)
 
-                data["gamestats"] = {
-                    "full": (tl,br),
-                    "sections": {
-                        "score": score_box,
-                        "kda": kda_box,
-                        "cs": cs_box,
-                        "clock": clock_box
-                    }
-                }
-            else:
-                data[key_name] = {
-                    "full": (tl,br)
-                }
+    def showEvent(self, event):
+        super().showEvent(event)
+        screen = QApplication.primaryScreen().geometry()
+        self.move(
+            (screen.width() - self.width()) // 2,
+            (screen.height() - self.height()) // 2,
+        )
+        self.text_input.setFocus()
 
-        return data
+    def _submit(self):
+        text = self.text_input.text().strip()
+        if text and self.callback:
+            self.callback(text)
+        self.close()
 
-    def extract_box(self,tl:tuple[int,int],br:tuple[int,int]):
-        return self.img[tl[1]:br[1],tl[0]:br[0]]
-
-    def display_boxes(self):
-        boxes = self.get_boxes()
-        for key in FEATURES:
-            if boxes[key] is None:
-                continue
-            og = self.img.copy()
-            cv.rectangle(og, boxes[key]["full"][0], boxes[key]["full"][1], (0,255,0))
-            cv.imshow(key, og)
-
-    def export_state(self):
-        return self.get_boxes()
 
 class Overlay(QMainWindow):
+
     def __init__(self):
         super().__init__()
         # Set flags for: No border, Always on Top, and Click-Through
@@ -523,6 +307,9 @@ class Overlay(QMainWindow):
         self.rectangles = []
         self.circles = []
         self.arrows = []
+        self.text_boxes = []
+        self.gemini_buttons = []
+        self.tab_buttons = []
 
         self.resize(SCREEN_SIZE[0], SCREEN_SIZE[1])
         self.show()
@@ -530,6 +317,26 @@ class Overlay(QMainWindow):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+
+        for i,box in enumerate(self.text_boxes):
+            x, y, text, color, font_size = box
+            font = QFont('Arial', font_size)
+            font.setBold(font_size >= 12)
+            painter.setFont(font)
+            fm = painter.fontMetrics()
+            tw = fm.horizontalAdvance(text)
+            th = fm.height()
+            pad = 10
+            bx = x
+            by = y
+            bw = tw + pad * 2
+            bh = th + pad * 2
+            painter.fillRect(bx, by, bw, bh, QColor(255, 255, 255, 255))
+            painter.setPen(QPen(QColor(0, 0, 0), 1))
+            painter.drawRect(bx, by, bw, bh)
+            painter.setPen(Qt.GlobalColor.black)
+            painter.drawText(bx + pad, by + pad + fm.ascent(), text)
 
         # Draw each rectangle using TL and BR points
         for rect_coords in self.rectangles:
@@ -564,6 +371,14 @@ class Overlay(QMainWindow):
             # Draw the circle using drawEllipse
             painter.drawEllipse(int(center_x - radius), int(center_y - radius),
                                 int(radius * 2), int(radius * 2))
+
+        # Draw gemini buttons
+        for btn in self.gemini_buttons:
+            self._paint_gemini_button(painter, btn)
+
+        # Draw tab buttons
+        for tab in self.tab_buttons:
+            self._paint_tab_button(painter, tab)
 
         # Draw each arrow
         for arrow_coords in self.arrows:
@@ -606,7 +421,7 @@ class Overlay(QMainWindow):
         painter.drawLine(int(end_x), int(end_y), int(x1), int(y1))
         painter.drawLine(int(end_x), int(end_y), int(x2), int(y2))
 
-    def add_rectangle(self, top_left, bottom_right, filled=True, color=(255, 0, 0)):
+    def add_rectangle(self, top_left:tuple[int,int], bottom_right:tuple[int,int], filled=True, color=(255, 0, 0)):
         """Add a new rectangle given top-left and bottom-right points
 
         Args:
@@ -619,6 +434,24 @@ class Overlay(QMainWindow):
         br_x, br_y = bottom_right
         self.rectangles.append((tl_x, tl_y, br_x, br_y, filled, color))
         self.update()  # Trigger repaint
+
+    @staticmethod
+    def _measure_text_box(text: str, font_size: int, pad: int = 10) -> tuple[int, int]:
+        from PyQt6.QtGui import QFontMetrics
+        font = QFont('Arial', font_size)
+        font.setBold(font_size >= 12)
+        fm = QFontMetrics(font)
+        return fm.horizontalAdvance(text) + pad * 2, fm.height() + pad * 2
+
+    def add_text_box(self, x: int, y: int, text: str, color=(255, 0, 0)):
+        self.text_boxes.append((x, y, text, color, 13))
+        self.update()
+        return self._measure_text_box(text, 13)
+
+    def add_small_text_box(self, x: int, y: int, text: str, color=(80, 80, 80), font_size: int = 9):
+        self.text_boxes.append((x, y, text, color, font_size))
+        self.update()
+        return self._measure_text_box(text, font_size)
 
     def add_circle(self, center, radius, filled=True):
         """Add a new circle given center point and radius
@@ -644,11 +477,352 @@ class Overlay(QMainWindow):
         self.arrows.append((start_x, start_y, end_x, end_y))
         self.update()  # Trigger repaint
 
+    def draw_button(self, completion: float, text: str,
+                    x: float = 0.775, y: float = 0.15,
+                    color: tuple = (38, 148, 73), progress_color: tuple = (55, 222, 108)):
+        tl_x = int(SCREEN_SIZE[0] * x)
+        tl_y = int(SCREEN_SIZE[1] * y)
+        tb_w, tb_h = self.add_text_box(tl_x, tl_y, text, color)
+        br_x = tl_x + tb_w
+        br_y = tl_y + tb_h
+        prog_x = tl_x + int(tb_w * completion)
+        self.add_rectangle((tl_x, tl_y), (prog_x, br_y), True, progress_color)
+        return (tl_x, tl_y), (br_x, br_y)
+
+    def _paint_gemini_button(self, painter: QPainter, btn: dict):
+        """Render a single Gemini-styled button with gradient, rounded rect, icon, and text."""
+        x, y, w, h = btn['x'], btn['y'], btn['w'], btn['h']
+        completion = btn.get('completion', 0.0)
+        radius = h // 2  # pill shape
+
+        # --- main button body ---
+        btn_rect = QRectF(x, y, w, h)
+        btn_path = QPainterPath()
+        btn_path.addRoundedRect(btn_rect, radius, radius)
+
+        grad = QLinearGradient(btn_rect.topLeft(), btn_rect.topRight())
+        grad.setColorAt(0.0, QColor(55, 115, 230))    # vibrant blue
+        grad.setColorAt(0.35, QColor(120, 75, 220))    # purple
+        grad.setColorAt(0.65, QColor(190, 60, 220))    # magenta-purple
+        grad.setColorAt(1.0, QColor(235, 90, 140))     # pink-coral
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(grad))
+        painter.drawPath(btn_path)
+
+        # --- completion fill (radial bloom from center, clipped to pill) ---
+        if completion > 0.0:
+            painter.save()
+            painter.setClipPath(btn_path)
+            import math
+            cx = x + w / 2
+            cy = y + h / 2
+            max_r = math.hypot(w / 2, h / 2)
+            r = max_r * min(completion, 1.0)
+            bloom = QRadialGradient(cx, cy, r)
+            bloom.setColorAt(0.0, QColor(255, 255, 255, 90))
+            bloom.setColorAt(0.6, QColor(200, 170, 255, 70))
+            bloom.setColorAt(1.0, QColor(200, 170, 255, 0))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(bloom))
+            painter.drawEllipse(QRectF(cx - r, cy - r, r * 2, r * 2))
+            painter.restore()
+
+        # thin bright border for crispness
+        border_grad = QLinearGradient(btn_rect.topLeft(), btn_rect.topRight())
+        border_grad.setColorAt(0.0, QColor(100, 160, 255, 160))
+        border_grad.setColorAt(0.5, QColor(180, 120, 255, 160))
+        border_grad.setColorAt(1.0, QColor(255, 120, 180, 160))
+        painter.setPen(QPen(QBrush(border_grad), 1.5))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPath(btn_path)
+
+        # --- icon ---
+        icon_size = int(h * 0.55)
+        icon_x = x + int(h * 0.35)
+        icon_y = y + (h - icon_size) // 2
+        if btn.get('icon'):
+            painter.drawPixmap(int(icon_x), int(icon_y), icon_size, icon_size, btn['icon'])
+
+        # --- text ---
+        text_x = icon_x + icon_size + int(h * 0.2)
+        font = QFont('Arial', max(int(h * 0.32), 11))
+        font.setBold(True)
+        painter.setFont(font)
+        painter.setPen(QColor(255, 255, 255))
+        text_rect = QRectF(text_x, y, w - (text_x - x) - int(h * 0.3), h)
+        painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter, btn['text'])
+
+    def draw_gemini_button(self, text: str = "Ask Coach!!",
+                           x: float = 0.775, y: float = 0.15,
+                           completion: float = 0.0):
+        """Add a Gemini-styled rounded button to the overlay.
+
+        Args:
+            text: button label
+            x: center x as fraction of screen width
+            y: center y as fraction of screen height
+            completion: 0.0–1.0 hover-fill progress
+        Returns:
+            (tl, br) bounding box in screen pixels
+        """
+        import os
+        icon_path = os.path.join(os.path.dirname(__file__), 'gemini_icon.png')
+        icon = QPixmap(icon_path) if os.path.exists(icon_path) else None
+
+        font = QFont('Arial', 14)
+        font.setBold(True)
+        from PyQt6.QtGui import QFontMetrics
+        fm = QFontMetrics(font)
+        text_w = fm.horizontalAdvance(text)
+
+        btn_h = 44
+        icon_space = int(btn_h * 0.55) + int(btn_h * 0.55)  # icon + padding
+        btn_w = int(btn_h * 0.35) + icon_space + text_w + int(btn_h * 0.3)
+
+        px = int(SCREEN_SIZE[0] * x) - btn_w // 2
+        py = int(SCREEN_SIZE[1] * y) - btn_h // 2
+
+        self.gemini_buttons.append({
+            'x': px, 'y': py, 'w': btn_w, 'h': btn_h,
+            'text': text, 'icon': icon,
+            'completion': completion,
+        })
+        self.update()
+        return (px, py), (px + btn_w, py + btn_h)
+
+    def _paint_tab_button(self, painter: QPainter, tab: dict):
+        """Render a small tab button with solid bg, optional text/icon, and radial bloom."""
+        import math
+        x, y, w, h = tab['x'], tab['y'], tab['w'], tab['h']
+        completion = tab.get('completion', 0.0)
+        bg = tab.get('bg', (60, 120, 200))
+        radius = h // 2
+
+        btn_rect = QRectF(x, y, w, h)
+        btn_path = QPainterPath()
+        btn_path.addRoundedRect(btn_rect, radius, radius)
+
+        # solid bg
+        r, g, b = bg
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(QColor(r, g, b)))
+        painter.drawPath(btn_path)
+
+        # radial bloom
+        if completion > 0.0:
+            painter.save()
+            painter.setClipPath(btn_path)
+            cx = x + w / 2
+            cy = y + h / 2
+            max_r = math.hypot(w / 2, h / 2)
+            br = max_r * min(completion, 1.0)
+            bloom = QRadialGradient(cx, cy, br)
+            bloom.setColorAt(0.0, QColor(255, 255, 255, 100))
+            bloom.setColorAt(0.6, QColor(255, 255, 255, 50))
+            bloom.setColorAt(1.0, QColor(255, 255, 255, 0))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(bloom))
+            painter.drawEllipse(QRectF(cx - br, cy - br, br * 2, br * 2))
+            painter.restore()
+
+        # subtle border
+        painter.setPen(QPen(QColor(255, 255, 255, 70), 1))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawPath(btn_path)
+
+        # icon (centered)
+        if tab.get('icon'):
+            icon_size = int(h * 0.55)
+            if tab.get('text'):
+                # icon left, text right
+                ix = x + int(h * 0.3)
+            else:
+                # icon centered
+                ix = x + (w - icon_size) / 2
+            iy = y + (h - icon_size) / 2
+            painter.drawPixmap(int(ix), int(iy), icon_size, icon_size, tab['icon'])
+
+        # text
+        if tab.get('text'):
+            font = QFont('Arial', max(int(h * 0.30), 10))
+            font.setBold(True)
+            painter.setFont(font)
+            painter.setPen(QColor(255, 255, 255))
+            if tab.get('icon'):
+                icon_size = int(h * 0.55)
+                tx = x + int(h * 0.3) + icon_size + int(h * 0.15)
+                text_rect = QRectF(tx, y, w - (tx - x) - int(h * 0.2), h)
+                align = Qt.AlignmentFlag.AlignVCenter
+            else:
+                text_rect = btn_rect
+                align = Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignHCenter
+            painter.drawText(text_rect, align, tab['text'])
+
+    def draw_tab_button(self, cx: int, cy: int, w: int, h: int,
+                        text: str | None = None, icon: QPixmap | None = None,
+                        bg: tuple = (60, 120, 200),
+                        completion: float = 0.0):
+        """Add a tab button centered at (cx, cy) in screen pixels.
+
+        Returns:
+            (tl, br) bounding box in screen pixels
+        """
+        px = cx - w // 2
+        py = cy - h // 2
+        self.tab_buttons.append({
+            'x': px, 'y': py, 'w': w, 'h': h,
+            'text': text, 'icon': icon, 'bg': bg,
+            'completion': completion,
+        })
+        self.update()
+        return (px, py), (px + w, py + h)
+
+    def draw_status(self, text: str, color: tuple = (200, 120, 0), x: float = 0.775, y: float = 0.05):
+        px = int(SCREEN_SIZE[0] * x)
+        py = int(SCREEN_SIZE[1] * y)
+        self.add_small_text_box(px, py, text, color=color, font_size=10)
+
+    def draw_transaction_table(self, transactions: list[dict], x: float = 0.10, y: float = 0.30,
+                               hover_zones: dict | None = None):
+        """Draw extracted transactions as a table on the overlay.
+
+        Args:
+            transactions: list of dicts with keys: date, company, amount
+            x: left edge as fraction of screen width
+            y: top edge as fraction of screen height
+            hover_zones: dict of (row, col) -> completion float for hover highlights.
+                         col -1 = X button. cols 0/1/2 = date/company/amount.
+
+        Returns:
+            list of hitboxes: [(x1, y1, x2, y2, row_idx, col_idx), ...]
+            col_idx -1 = X delete button, 0 = date, 1 = company, 2 = amount
+        """
+        if not transactions:
+            return []
+
+        if hover_zones is None:
+            hover_zones = {}
+
+        px = int(SCREEN_SIZE[0] * x)
+        py = int(SCREEN_SIZE[1] * y)
+        x_btn_w = 25  # width of X button column
+        col_widths = [120, 180, 80]  # date, company, amount
+        row_h = 35
+        header_color = (40, 40, 40)
+        row_color = (60, 60, 60)
+        hitboxes = []
+
+        # Header row (offset right to account for X column)
+        headers = ["Date", "Company", "Amount"]
+        cx = px + x_btn_w
+        for j, hdr in enumerate(headers):
+            self.add_small_text_box(cx, py, hdr, color=header_color, font_size=10)
+            cx += col_widths[j]
+
+        # Data rows
+        keys = ["date", "company", "amount"]
+        for i, txn in enumerate(transactions):
+            ry = py + (i + 1) * row_h
+
+            # X delete button
+            x_compl = hover_zones.get((i, -1), 0.0)
+            x_color = (200, 50, 50) if x_compl > 0 else (150, 150, 150)
+            self.add_small_text_box(px, ry, "X", color=x_color, font_size=9)
+            x_w, x_h = self._measure_text_box("X", 9)
+            if x_compl > 0:
+                prog_x = px + int(x_w * x_compl)
+                self.add_rectangle((px, ry), (prog_x, ry + x_h), True, (200, 50, 50))
+            hitboxes.append((px, ry, px + x_w, ry + x_h, i, -1))
+
+            # Data cells
+            cx = px + x_btn_w
+            vals = [
+                txn.get("date") or "—",
+                txn.get("company") or "—",
+                txn.get("amount") or "—",
+                ]
+            for j, val in enumerate(vals):
+                cell_compl = hover_zones.get((i, j), 0.0)
+                cell_color = (30, 90, 160) if cell_compl > 0 else row_color
+                self.add_small_text_box(cx, ry, val, color=cell_color, font_size=9)
+                cw, ch = self._measure_text_box(val, 9)
+                if cell_compl > 0:
+                    prog_x = cx + int(cw * cell_compl)
+                    self.add_rectangle((cx, ry), (prog_x, ry + ch), True, (30, 90, 160))
+                hitboxes.append((cx, ry, cx + cw, ry + ch, i, j))
+                cx += col_widths[j]
+
+        return hitboxes
+
+
+
+    '''
+    loading states:
+    uploading prompt: up arrow moving up (cycle)
+    uploaded complete: green circle with blink
+    uploaded fail: red x constant blink 1s, hover for more details
+    receiving prompt (?necessary): down arrow moving down (cycle)
+    - maybe the O and X should overlay the curr arrow?
+    
+    
+    '''
+
+
+    def draw_loading_icon(self):
+        #draws an icon showing prompt currently loading / in progress
+        #this should sit right under the gemini button
+        return
+
+    def draw_updater_icon(self, icon_status: str):
+        #draws an icon showing the status of the continuous updater
+
+        return
+
+
+    """
+    draw loading icon
+    - this should 
+    
+    draw updater icon
+    
+    draw 
+    
+    
+    
+    photoshop + ui design
+    -recommend spot for user to put button
+    -upon answer, do a spin animation and turn into a character with eyes
+    -talk downwards ie let the text bubble cover the map, but onhover the text bubble opacity dim by a lot
+    
+    -fade in the ok button after 2s, make the accept animation quick, change the color scheme (mayb make it simple)
+    -faded map is how you put markers 
+    
+    
+    -audio
+    -text coming out at reading speed
+    -pages: a page indicator like this   <  1/5  >
+    
+    
+    coach's teaching tools:
+    -markers, map markers
+    -text + audio tips
+    -playing videos, showing images from online
+    -capturing short videos from past plays, capturing images too
+        -
+    """
+
+
+
+
     def clearCanvas(self):
         """Clear all shapes from the canvas"""
         self.rectangles.clear()
         self.circles.clear()
         self.arrows.clear()
+        self.text_boxes.clear()
+        self.gemini_buttons.clear()
+        self.tab_buttons.clear()
         self.update()  # Trigger repaint
 
     def hideCanvas(self):
@@ -667,7 +841,6 @@ class Overlay(QMainWindow):
             int((br[0] / img_w) * SCREEN_SIZE[0]),
             int((br[1] / img_h) * SCREEN_SIZE[1])
         )
-
 
 DYDX = []
 

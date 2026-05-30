@@ -10,8 +10,6 @@ def make_get_req(path: str, params: dict = None) -> dict | list | str:
     resp.raise_for_status()
     return resp.json()
 
-
-
 def get_all_game_data() -> dict:
     return make_get_req("/allgamedata")
 
