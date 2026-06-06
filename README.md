@@ -31,6 +31,18 @@ On launch, a dimmed screen overlay appears with a crosshair - click to place the
 4. **Live Coaching** - the app pulls your live game state from the Riot Client API, compresses it, and sends it to Gemini for instant advice
 5. **Session Memory** - the coach remembers your last game and carries context across sessions
 
+## Architecture
+
+The overlay is built on a **Model–View–Controller** split so state, rendering, and input stay independent:
+
+- **Model** (`server/model.py`) — `CoachModel` holds all app state: where the button sits, the hover-fill progress, the current state-machine phase (`idle → filling → unfurled → closing → cooldown`), and the latest user question. Pure data, no PyQt, no logic.
+- **View** (`server/view.py`) — `Overlay` (plus the `ButtonPlacer` and `PromptWindow` widgets) renders the transparent always-on-top UI. Its `render(model)` draws the frame purely from model state and returns the on-screen geometry of each button so it can be hit-tested. The view never mutates the model.
+- **Controller** (`server/controller.py`) — `OverlayController` reads user input (cursor position via `pyautogui`, prompt submissions), runs the state machine, and mutates the model. It owns the per-frame `tick()`.
+
+Each frame (~60fps via `QTimer`): `controller.tick()` → `view.render(model)` draws and reports geometry → the controller reads the cursor against that geometry → mutates the model → next frame's render reflects the change. `server/main.py` is just the wiring that builds the three pieces and starts the loop.
+
+The data/services backing the model live in `server/resources/` (`gemini.py` for coaching, `riot.py` for live game state) and `server/utils.py` (screen capture and OCR helpers).
+
 ## Configure Gemini
 
 The app uses Google's Gemini API for coaching intelligence. You will need a Gemini API key.
