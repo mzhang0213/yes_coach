@@ -6,7 +6,7 @@ hit-tests the geometry the view reports back.
 """
 import pyautogui
 
-from server.model import CoachModel
+from server.model import OverlayModel
 from server.resources.riot import *
 from server.view import PromptWindow
 
@@ -37,7 +37,7 @@ class OverlayController:
         self.prompt_window = PromptWindow(callback=on_submit)
         self.prompt_window.show()
 
-    def update_game_state(self, model: CoachModel):
+    def update_game_state(self, model: OverlayModel):
         #read state from Riot API at curr time (RN) and log in memory
         #read chat updates too
         # model.update_players()

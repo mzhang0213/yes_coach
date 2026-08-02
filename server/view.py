@@ -143,7 +143,7 @@ class PromptWindow(QWidget):
         self.close()
 
 
-class Overlay(QMainWindow):
+class OverlayView(QMainWindow):
 
     def __init__(self):
         super().__init__()

@@ -5,7 +5,7 @@ no drawing, no input handling — just state.
 """
 
 
-class CoachModel:
+class OverlayModel:
     # State: idle → filling → unfurled → closing → cooldown → idle
     #   idle:     main button only
     #   filling:  hovering main button, bloom rising

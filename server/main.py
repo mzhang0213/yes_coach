@@ -4,13 +4,13 @@ import cv2 as cv
 from PyQt6.QtCore import QTimer
 
 from server.utils import app, stop_screen_capture
-from server.model import CoachModel
-from server.view import Overlay, ButtonPlacer
+from server.model import OverlayModel
+from server.view import OverlayView, ButtonPlacer
 from server.controller import OverlayController
 
-model = CoachModel()
-window = Overlay()
-controller = OverlayController(model, window)
+model = OverlayModel()
+view = OverlayView()
+controller = OverlayController(model, view)
 
 model.button_pos = ButtonPlacer().pick()
 
