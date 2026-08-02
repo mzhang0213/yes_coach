@@ -1,8 +1,9 @@
 """View layer — overlay rendering and input widgets.
 
-Renders application state (CoachModel) onto a transparent, always-on-top
-overlay, plus the auxiliary region-picker and prompt widgets. Pure
-presentation: holds no game logic and never mutates the model.
+Renders the session's UI state onto a transparent, always-on-top overlay, plus
+the auxiliary region-picker and prompt widgets. Pure presentation: holds no game
+logic and never mutates state; game-specific cards are delegated to the
+adapter's UICards.
 """
 import os
 
@@ -143,7 +144,7 @@ class PromptWindow(QWidget):
         self.close()
 
 
-class Overlay(QMainWindow):
+class OverlayView(QMainWindow):
 
     def __init__(self):
         super().__init__()
@@ -557,6 +558,23 @@ class Overlay(QMainWindow):
         self.update()
         return (px, py), (px + w, py + h)
 
+    def _draw_status_pill(self, button_pos: dict, text: str,
+                          bg: tuple = (70, 70, 78)):
+        """Filled pill (matching the button's footprint) showing a status message.
+
+        Drawn at the same center as the main button so it sits where the player
+        placed it. Uses the solid tab-button renderer (no hover bloom).
+        """
+        from PyQt6.QtGui import QFontMetrics
+        h = 44
+        font = QFont('Arial', max(int(h * 0.30), 10))
+        font.setBold(True)
+        text_w = QFontMetrics(font).horizontalAdvance(text)
+        w = text_w + h  # pill padding ~ half-height each side
+        cx = int(SCREEN_SIZE[0] * button_pos['x'])
+        cy = int(SCREEN_SIZE[1] * button_pos['y'])
+        self.draw_tab_button(cx, cy, w, h, text=text, bg=bg, completion=0.0)
+
     def draw_status(self, text: str, color: tuple = (200, 120, 0), x: float = 0.775, y: float = 0.05):
         px = int(SCREEN_SIZE[0] * x)
         py = int(SCREEN_SIZE[1] * y)
@@ -644,28 +662,35 @@ class Overlay(QMainWindow):
 
         return
 
-    def render(self, model) -> dict | None:
-        """Reflect the model's state onto the canvas for one frame.
+    def render(self, session, cards) -> dict | None:
+        """Reflect the session's UI state onto the canvas for one frame.
 
-        Draws the main button (always) and, when unfurled/closing, the side
-        tabs — reading completion/state straight from the model. Returns the
-        on-screen geometry the controller needs for hit-testing, or None if
-        there is nothing to draw yet.
+        Draws the main button (in-game) or a phase-aware status pill (pre-game),
+        delegating game-specific cards to the adapter's `cards`. Returns the
+        geometry the controller hit-tests, or None if nothing is interactive.
         """
         self.clearCanvas()
-        if not model.button_pos:
+        ui = session.model
+        if not ui.button_pos:
             return None
+
+        # No active game → phase-aware status pill + any pre-game cards. Returning
+        # {'zones': [...]} keeps only the cards' action buttons interactive.
+        if not ui.in_game:
+            self._draw_status_pill(ui.button_pos, cards.phase_label(ui.phase))
+            zones = cards.draw_pregame(self, session)
+            return {'zones': zones} if zones else None
 
         # always draw main button
         (bx1, by1), (bx2, by2) = self.draw_gemini_button(
-            "Ask Coach!!", x=model.button_pos['x'], y=model.button_pos['y'],
-            completion=model.compl,
+            "Ask Coach!!", x=ui.button_pos['x'], y=ui.button_pos['y'],
+            completion=ui.compl,
         )
 
         left_boxes = []
         right_box = None
 
-        if model.state in ('unfurled', 'closing'):
+        if ui.state in ('unfurled', 'closing'):
             main_w = bx2 - bx1
             main_h = by2 - by1
             main_cy = (by1 + by2) // 2
@@ -677,19 +702,20 @@ class Overlay(QMainWindow):
             gap = 10
             tab_gap = 5
 
-            frozen = model.state == 'closing'
+            frozen = ui.state == 'closing'
 
             # ── left tabs (stacked, centered vertically on main button) ──
-            total_left_h = 3 * tab_h + 2 * tab_gap
+            n = len(ui.left_texts)
+            total_left_h = n * tab_h + max(n - 1, 0) * tab_gap
             left_top = main_cy - total_left_h // 2
             left_cx = bx1 - gap - tab_w // 2
 
-            for i in range(3):
+            for i in range(n):
                 ty = left_top + i * (tab_h + tab_gap) + tab_h // 2
                 box = self.draw_tab_button(
                     left_cx, ty, tab_w, tab_h,
-                    text=model.left_texts[i], bg=(50, 100, 190),
-                    completion=0.0 if frozen else model.left_compls[i],
+                    text=ui.left_texts[i], bg=(50, 100, 190),
+                    completion=0.0 if frozen else ui.left_compls[i],
                 )
                 left_boxes.append((*box[0], *box[1]))
 
@@ -698,11 +724,15 @@ class Overlay(QMainWindow):
             rbox = self.draw_tab_button(
                 right_cx, main_cy, tab_w_right, tab_h,
                 icon=self.notebook_icon, bg=(180, 180, 180),
-                completion=0.0 if frozen else model.right_compl,
+                completion=0.0 if frozen else ui.right_compl,
             )
             right_box = (*rbox[0], *rbox[1])
 
-        return {'main': (bx1, by1, bx2, by2), 'left': left_boxes, 'right': right_box}
+        geom = {'main': (bx1, by1, bx2, by2), 'left': left_boxes, 'right': right_box}
+        ingame_zones = cards.draw_ingame(self, session)
+        if ingame_zones:
+            geom['zones'] = ingame_zones
+        return geom
 
     def clearCanvas(self):
         """Clear all shapes from the canvas"""

@@ -1,0 +1,15 @@
+@import "tailwindcss";
+
+@theme {
+  --color-hextech-gold: #c8aa6e;
+  --color-hextech-gold-bright: #f0e6d2;
+  --color-hextech-teal: #0ac8b9;
+  --color-hextech-blue: #0a1428;
+  --color-hextech-navy: #091428;
+  --font-display: var(--font-display), ui-serif, serif;
+}
+
+body {
+  background-color: #060d1a;
+  color: #f0e6d2;
+}

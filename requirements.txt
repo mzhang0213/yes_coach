@@ -4,4 +4,11 @@ mss>=6.1.0
 pillow>=8.0.0
 pyqt6
 requests
-#pip install -q -U google-genai
+urllib3
+python-dotenv
+google-genai
+matplotlib
+ollama
+pyautogui
+pytesseract
+psutil
