@@ -44,13 +44,13 @@ class CoachModel:
             }
         ]
 
-    def update_players(self, raw_data):
-        #update the players
-        return
-
-    def update_events(self, raw_data):
-        #update the events 直接
-        self.events = raw_data
+    # def update_players(self, raw_data):
+    #     #update the players
+    #     return
+    #
+    # def update_events(self, raw_data):
+    #     #update the events 直接
+    #     self.events = raw_data
 
     def update_game_stats(self, raw_data):
         #update the game stats

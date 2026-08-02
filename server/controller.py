@@ -40,9 +40,9 @@ class OverlayController:
     def update_game_state(self, model: CoachModel):
         #read state from Riot API at curr time (RN) and log in memory
         #read chat updates too
-        model.update_players()
-        model.update_game_stats()
-        model.update_events()
+        # model.update_players()
+        # model.update_game_stats()
+        # model.update_events()
         return
 
 
