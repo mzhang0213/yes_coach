@@ -684,11 +684,11 @@ class OverlayView(QMainWindow):
             left_top = main_cy - total_left_h // 2
             left_cx = bx1 - gap - tab_w // 2
 
-            for i in range(3):
+            for i in range(len(model.quick_actions)):
                 ty = left_top + i * (tab_h + tab_gap) + tab_h // 2
                 box = self.draw_tab_button(
                     left_cx, ty, tab_w, tab_h,
-                    text=model.left_texts[i], bg=(50, 100, 190),
+                    text=model.quick_actions[i], bg=(50, 100, 190),
                     completion=0.0 if frozen else model.left_compls[i],
                 )
                 left_boxes.append((*box[0], *box[1]))

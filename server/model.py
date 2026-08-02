@@ -20,21 +20,15 @@ class OverlayModel:
         self.state = 'idle'
         self.has_left = False  # user moved cursor off all buttons since unfurl
 
-        self.left_texts = ["Suggest plays", "Team comp", "Build path"]
+        self.quick_actions = []
         self.left_compls = [0.0, 0.0, 0.0]
         self.right_compl = 0.0
 
-
         #actual game state
-
         self.active_player = {}
-
         self.players = []
-
         self.game_stats = {}
-
         self.events = []
-
         self.checkpoints = [
             {
                 "title":"",
@@ -51,6 +45,8 @@ class OverlayModel:
     # def update_events(self, raw_data):
     #     #update the events 直接
     #     self.events = raw_data
+
+    def update_quick_actions(self, new_actions:list[str]):
 
     def update_game_stats(self, raw_data):
         #update the game stats
