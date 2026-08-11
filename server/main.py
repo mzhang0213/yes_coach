@@ -5,14 +5,16 @@ from PyQt6.QtCore import QTimer
 
 from server.utils import app, stop_screen_capture
 from server.model import OverlayModel
+from server.resources.league.league_model import LeagueModel
 from server.view import OverlayView, ButtonPlacer
 from server.controller import OverlayController
 
-model = OverlayModel()
+game = LeagueModel()
+model = OverlayModel(game)
 view = OverlayView()
 controller = OverlayController(model, view)
 
-model.button_pos = ButtonPlacer().pick()
+view.button_pos = ButtonPlacer().pick()
 
 # QTimer fires tick() every 16ms (~60fps) on the main thread inside app.exec()
 timer = QTimer()

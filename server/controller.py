@@ -4,6 +4,9 @@ Reads user input (cursor position, prompt submissions), drives the overlay
 state machine, and mutates the model. Asks the view to render each frame, then
 hit-tests the geometry the view reports back.
 """
+import os
+import threading
+
 import pyautogui
 
 from server.model import OverlayModel
@@ -17,6 +20,10 @@ class OverlayController:
         self.model = model
         self.view = view
         self.prompt_window = None
+        # Gemini coach: built lazily on a worker thread, guarded (see _get_coach)
+        self._coach = None
+        self._coach_failed = False
+        self._coach_lock = threading.Lock()
 
     @staticmethod
     def _in_box(x, y, box):
@@ -37,14 +44,56 @@ class OverlayController:
         self.prompt_window = PromptWindow(callback=on_submit)
         self.prompt_window.show()
 
+    def _get_coach(self):
+        """Build the Gemini coach once, thread-safe. Returns None if unavailable.
+
+        Import is deferred here (not at module load) so a missing/broken Gemini
+        SDK degrades to status-only instead of crashing startup. A failure is
+        latched so we don't re-attempt disk/network I/O on every checkpoint.
+        """
+        with self._coach_lock:
+            if self._coach is None and not self._coach_failed:
+                keys = [v for k, v in os.environ.items() if k.startswith("GEMINI_API_KEY")]
+                if not keys:
+                    self._coach_failed = True
+                else:
+                    try:
+                        from server.resources.gemini import LoLCoach
+                        self._coach = LoLCoach(api_keys=keys)
+                    except Exception as e:
+                        print(f"[coach] init failed: {e}")
+                        self._coach_failed = True
+            return self._coach
+
+    def _run_coach(self, cp):
+        """Worker body: fetch event advice off the main thread and marshal it
+        back onto the model (plain attribute writes only — no Qt from here)."""
+        coach = self._get_coach()
+        if coach is None:
+            return
+        try:
+            result = coach.get_advice(schema_key="event")
+        except Exception as e:
+            print(f"[coach] advice failed: {e}")
+            return
+        game = self.model.game
+        game.advice = result
+        reaction = result.get("reaction") if isinstance(result, dict) else None
+        game.status = f"{cp.title} — {reaction}" if reaction else f"Checkpoint: {cp.title}"
+
     def update_game_state(self, model: OverlayModel):
         #read state from Riot API at curr time (RN) and log in memory
-        #read chat updates too
-        # model.update_players()
-        # model.update_game_stats()
-        # model.update_events()
-        return
+        try:
+            stats = get_game_stats()
+            events = get_event_data()
+        except Exception:
+            return  # no live game / client unreachable — keep prior state
 
+        snap = model.game.ingest(stats, events)
+        for cp in model.game.evaluate_checkpoints(snap):
+            # show the hit immediately; the coach thread refines the text later
+            model.game.status = f"Checkpoint: {cp.title}"
+            threading.Thread(target=self._run_coach, args=(cp,), daemon=True).start()
 
     def tick(self):
         m = self.model
@@ -56,81 +105,18 @@ class OverlayController:
             return
 
         mx, my = pyautogui.position()
-        on_main = self._in_box(mx, my, geom['main'])
+        hover = {
+            'main': self._in_box(mx, my, geom['main']),
+            'left': [self._in_box(mx, my, lb) for lb in geom['left']],
+            'right': geom['right'] is not None and self._in_box(mx, my, geom['right']),
+        }
 
-        # ── idle ──────────────────────────────────────────────
-        if m.state == 'idle':
-            if on_main:
-                m.state = 'filling'
-                m.compl = 0.019
-
-        # ── filling ───────────────────────────────────────────
-        elif m.state == 'filling':
-            if on_main:
-                if int(m.compl * 100) / 100 >= 0.98:
-                    m.state = 'unfurled'
-                    m.compl = 1.0
-                    m.has_left = False
-                elif m.compl <= 1.0:
-                    m.compl += 0.019
-            else:
-                m.state = 'idle'
-                m.compl = 0.0
-
-        # ── unfurled ──────────────────────────────────────────
-        elif m.state == 'unfurled':
-            m.compl = 0.0
-
-            # ── hover logic ──
-            on_any = on_main
-            for i, lb in enumerate(geom['left']):
-                if self._in_box(mx, my, lb):
-                    on_any = True
-                    if int(m.left_compls[i] * 100) / 100 >= 0.98:
-                        # TODO: trigger left tab action
-                        m.left_compls[i] = 0.0
-                    elif m.left_compls[i] <= 1.0:
-                        m.left_compls[i] += 0.019
-                else:
-                    m.left_compls[i] = 0.0
-
-            if self._in_box(mx, my, geom['right']):
-                on_any = True
-                if int(m.right_compl * 100) / 100 >= 0.98:
-                    m.right_compl = 0.0
-                    self.show_prompt_window()
-                elif m.right_compl <= 1.0:
-                    m.right_compl += 0.019
-            else:
-                m.right_compl = 0.0
-
-            if not on_any:
-                m.has_left = True
-
-            # re-hover on OG after leaving → start close animation
-            if m.has_left and on_main:
-                m.state = 'closing'
-                m.compl = 0.0
-                m.left_compls = [0.0, 0.0, 0.0]
-                m.right_compl = 0.0
-
-        # ── closing ──────────────────────────────────────────
-        elif m.state == 'closing':
-            # bloom on main button to confirm close
-            if on_main:
-                if int(m.compl * 100) / 100 >= 0.98:
-                    m.state = 'cooldown'
-                    m.compl = 0.0
-                    m.has_left = False
-                elif m.compl <= 1.0:
-                    m.compl += 0.019
-            else:
-                # moved off main → cancel close, back to unfurled
-                m.state = 'unfurled'
-                m.compl = 1.0
-
-        # ── cooldown ─────────────────────────────────────────
-        elif m.state == 'cooldown':
-            # wait for cursor to leave main button before re-enabling
-            if not on_main:
-                m.state = 'idle'
+        # view advances its own button animations + state machine and reports
+        # any button that crossed its activation threshold this frame
+        press = self.view.advance(hover)
+        if press:
+            m.record_press(press)
+            if press == 'right':
+                self.show_prompt_window()
+            # elif press.startswith('left:'):
+            #     TODO: trigger the corresponding quick action

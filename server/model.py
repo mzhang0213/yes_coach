@@ -1,42 +1,18 @@
 """Model layer — application state for the coach overlay.
 
-Holds the data the view renders from and the controller mutates. No PyQt,
-no drawing, no input handling — just state.
+Holds the game data the view renders from and the controller mutates, plus a
+log of which UI buttons were pressed and when. Button positions, animations and
+hover state live in the view — the model only cares that a press happened. No
+PyQt, no drawing, no input handling — just state.
 """
+import time
+
+from server.resources.game_model import GameModel
 
 
 class OverlayModel:
-    # State: idle → filling → unfurled → closing → cooldown → idle
-    #   idle:     main button only
-    #   filling:  hovering main button, bloom rising
-    #   unfurled: side tabs visible
-    #   closing:  re-hover bloom on main button, tabs frozen, completes → cooldown
-    #   cooldown: wait for cursor to leave main button before allowing re-trigger
-    def __init__(self):
-        self.button_pos = None
-        self.compl = 0.0
-        self.user_question = None
-
-        self.state = 'idle'
-        self.has_left = False  # user moved cursor off all buttons since unfurl
-
-        self.quick_actions = []
-        self.left_compls = [0.0, 0.0, 0.0]
-        self.right_compl = 0.0
-
-        #actual game state
-        self.active_player = {}
-        self.players = []
-        self.game_stats = {}
-        self.events = []
-        self.checkpoints = [
-            {
-                "title":"",
-                "indicator": {
-
-                }
-            }
-        ]
+    def __init__(self, game:GameModel):
+        self.game = game
 
     # def update_players(self, raw_data):
     #     #update the players
@@ -46,7 +22,12 @@ class OverlayModel:
     #     #update the events 直接
     #     self.events = raw_data
 
+    def record_press(self, button: str):
+        """Record that a UI button crossed its activation threshold, timestamped."""
+        self.presses.append({"button": button, "time": time.time()})
+
     def update_quick_actions(self, new_actions:list[str]):
+        self.quick_actions = new_actions
 
     def update_game_stats(self, raw_data):
         #update the game stats
@@ -96,8 +77,6 @@ class OverlayModel:
                     "displayName": raw_data[k]["displayName"]
                 }
             return filtered
-
-
         elif category == "gameStats":
             filtered = {}
             keys = ["gameMode", "gameTime"]
@@ -108,3 +87,8 @@ class OverlayModel:
         else:
             print(f"UNCAUGHT CATEGORY: {category}")
             return None
+
+    #ai interfacing
+    # def run_query(self, prompt:str):
+
+    #checkpoint interfacing

@@ -186,6 +186,15 @@ class OverlayView(QMainWindow):
         self.gemini_buttons = []
         self.tab_buttons = []
 
+        # ── interaction state (the view owns button positions + animations) ──
+        # idle → filling → unfurled → closing → cooldown → idle
+        self.button_pos = None
+        self.state = 'idle'
+        self.has_left = False  # cursor left all buttons since unfurl
+        self.compl = 0.0  # main-button hover-fill
+        self.left_compls = [0.0, 0.0, 0.0, 0.0, 0.0]
+        self.right_compl = 0.0
+
         # load notebook icon once
         icon_path = os.path.join(os.path.dirname(__file__), 'notebook_icon.png')
         self.notebook_icon = QPixmap(icon_path) if os.path.exists(icon_path) else None
@@ -645,27 +654,31 @@ class OverlayView(QMainWindow):
         return
 
     def render(self, model) -> dict | None:
-        """Reflect the model's state onto the canvas for one frame.
+        """Draw the current frame from the view's own interaction state.
 
         Draws the main button (always) and, when unfurled/closing, the side
-        tabs — reading completion/state straight from the model. Returns the
-        on-screen geometry the controller needs for hit-testing, or None if
-        there is nothing to draw yet.
+        tabs — reading fill/state from self and the tab labels (quick_actions)
+        from the model. Returns the on-screen geometry the controller needs for
+        hit-testing, or None if there is nothing to draw yet.
         """
         self.clearCanvas()
-        if not model.button_pos:
+        if not self.button_pos:
             return None
 
         # always draw main button
         (bx1, by1), (bx2, by2) = self.draw_gemini_button(
-            "Ask Coach!!", x=model.button_pos['x'], y=model.button_pos['y'],
-            completion=model.compl,
+            "Ask Coach!!", x=self.button_pos['x'], y=self.button_pos['y'],
+            completion=self.compl,
         )
+
+        # checkpoint status — re-emitted every frame since clearCanvas() wiped it
+        if model.game.status:
+            self.draw_status(model.game.status)
 
         left_boxes = []
         right_box = None
 
-        if model.state in ('unfurled', 'closing'):
+        if self.state in ('unfurled', 'closing'):
             main_w = bx2 - bx1
             main_h = by2 - by1
             main_cy = (by1 + by2) // 2
@@ -677,19 +690,27 @@ class OverlayView(QMainWindow):
             gap = 10
             tab_gap = 5
 
-            frozen = model.state == 'closing'
+            frozen = self.state == 'closing'
 
-            # ── left tabs (stacked, centered vertically on main button) ──
-            total_left_h = 3 * tab_h + 2 * tab_gap
+            # ── left action tabs (fanned around the left perimeter) ──
+            # 5 fixed slots on a left-facing arc: the middle slot bulges out
+            # furthest, top/bottom sit near the button edge. Actions fill the
+            # slots top-down, one by one.
+            import math
+            n_slots = len(self.left_compls)
+            total_left_h = n_slots * tab_h + (n_slots - 1) * tab_gap
             left_top = main_cy - total_left_h // 2
-            left_cx = bx1 - gap - tab_w // 2
+            left_base_cx = bx1 - gap - tab_w // 2  # x of the top/bottom slots
+            bulge = int(tab_w * 0.9)               # leftward push at the middle slot
 
-            for i in range(len(model.quick_actions)):
+            for i in range(min(len(model.game.quick_actions), n_slots)):
+                frac = i / (n_slots - 1)           # 0 (top) .. 1 (bottom)
                 ty = left_top + i * (tab_h + tab_gap) + tab_h // 2
+                tx = left_base_cx - int(bulge * math.sin(frac * math.pi))
                 box = self.draw_tab_button(
-                    left_cx, ty, tab_w, tab_h,
-                    text=model.quick_actions[i], bg=(50, 100, 190),
-                    completion=0.0 if frozen else model.left_compls[i],
+                    tx, ty, tab_w, tab_h,
+                    text=model.game.quick_actions[i], bg=(50, 100, 190),
+                    completion=0.0 if frozen else self.left_compls[i],
                 )
                 left_boxes.append((*box[0], *box[1]))
 
@@ -698,11 +719,111 @@ class OverlayView(QMainWindow):
             rbox = self.draw_tab_button(
                 right_cx, main_cy, tab_w_right, tab_h,
                 icon=self.notebook_icon, bg=(180, 180, 180),
-                completion=0.0 if frozen else model.right_compl,
+                completion=0.0 if frozen else self.right_compl,
             )
             right_box = (*rbox[0], *rbox[1])
 
         return {'main': (bx1, by1, bx2, by2), 'left': left_boxes, 'right': right_box}
+
+    def advance(self, hover: dict) -> str | None:
+        """Advance button-fill animations and the interaction state machine one frame.
+
+        State: idle → filling → unfurled → closing → cooldown → idle
+            idle:     main button only
+            filling:  hovering main button, bloom rising
+            unfurled: side tabs visible
+            closing:  re-hover bloom on main button, tabs frozen, completes → cooldown
+            cooldown: wait for cursor to leave main button before allowing re-trigger
+
+        Args:
+            hover: {'main': bool, 'left': list[bool], 'right': bool} — which buttons
+                   the cursor is over this frame (from the controller's hit-test).
+        Returns:
+            The id of a button that just crossed its activation threshold this frame
+            ('left:0'..'left:2' or 'right'), or None. Main-button open/close are
+            internal transitions and report no press.
+        """
+        on_main = hover['main']
+        press = None
+
+        # ── idle ──────────────────────────────────────────────
+        if self.state == 'idle':
+            if on_main:
+                self.state = 'filling'
+                self.compl = 0.019
+
+        # ── filling ───────────────────────────────────────────
+        elif self.state == 'filling':
+            if on_main:
+                if int(self.compl * 100) / 100 >= 0.98:
+                    self.state = 'unfurled'
+                    self.compl = 1.0
+                    self.has_left = False
+                elif self.compl <= 1.0:
+                    self.compl += 0.019
+            else:
+                self.state = 'idle'
+                self.compl = 0.0
+
+        # ── unfurled ──────────────────────────────────────────
+        elif self.state == 'unfurled':
+            self.compl = 0.0
+
+            # ── hover logic ──
+            on_any = on_main
+            for i, over in enumerate(hover['left']):
+                if over:
+                    on_any = True
+                    if int(self.left_compls[i] * 100) / 100 >= 0.98:
+                        press = f'left:{i}'
+                        self.left_compls[i] = 0.0
+                    elif self.left_compls[i] <= 1.0:
+                        self.left_compls[i] += 0.019
+                else:
+                    self.left_compls[i] = 0.0
+
+            if hover['right']:
+                on_any = True
+                if int(self.right_compl * 100) / 100 >= 0.98:
+                    press = 'right'
+                    self.right_compl = 0.0
+                elif self.right_compl <= 1.0:
+                    self.right_compl += 0.019
+            else:
+                self.right_compl = 0.0
+
+            if not on_any:
+                self.has_left = True
+
+            # re-hover on OG after leaving → start close animation
+            if self.has_left and on_main:
+                self.state = 'closing'
+                self.compl = 0.0
+                self.left_compls = [0.0, 0.0, 0.0, 0.0, 0.0]
+                self.right_compl = 0.0
+
+        # ── closing ──────────────────────────────────────────
+        elif self.state == 'closing':
+            # bloom on main button to confirm close
+            if on_main:
+                if int(self.compl * 100) / 100 >= 0.98:
+                    self.state = 'cooldown'
+                    self.compl = 0.0
+                    self.has_left = False
+                elif self.compl <= 1.0:
+                    self.compl += 0.019
+            else:
+                # moved off main → cancel close, back to unfurled
+                self.state = 'unfurled'
+                self.compl = 1.0
+
+        # ── cooldown ─────────────────────────────────────────
+        elif self.state == 'cooldown':
+            # wait for cursor to leave main button before re-enabling
+            if not on_main:
+                self.state = 'idle'
+
+        return press
 
     def clearCanvas(self):
         """Clear all shapes from the canvas"""
