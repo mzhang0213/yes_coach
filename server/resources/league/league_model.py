@@ -107,6 +107,18 @@ CHECKPOINTS = [
     ElderCheckpoint("elder spawn", 6 * 60),
 ]
 
+RECENT_WINDOW = 60.0  # seconds of game time kept for recent_context()
+
+# Riot event name → objective label used in recent_context()
+_OBJECTIVES = {
+    "DragonKill": "dragon",
+    "BaronKill": "baron",
+    "HeraldKill": "herald",
+    "HordeKill": "grubs",       # unverified event name, see CHECKPOINTS
+    "TurretKilled": "turret",
+    "InhibKilled": "inhib",
+}
+
 class LeagueModel(GameModel):
     def __init__(self):
         super().__init__(CHECKPOINTS, [])
@@ -118,6 +130,31 @@ class LeagueModel(GameModel):
         self.last_dragon_time: float | None = None
         self.clock = 0.0
         self.reached_log: list[str] = []
+
+        # rolling window of raw events (last RECENT_WINDOW s) + who-is-who,
+        # so recent_context() can say "you died to X" / "enemy took dragon"
+        self.recent_events: list[dict] = []
+        self.my_names: set[str] = set()
+        self.my_team: str | None = None
+        self.roster: dict[str, dict] = {}  # any name alias → {"team", "champion"}
+
+    def set_roster(self, active_player_name: str, players: list[dict]):
+        """Learn who the player is and every player's team/champion.
+
+        Takes /activeplayername and /playerlist output. Events name players by
+        game name, so each player is indexed under riotId, riotIdGameName and
+        summonerName.
+        """
+        self.roster = {}
+        self.my_names = set()
+        for p in players:
+            info = {"team": p.get("team"), "champion": p.get("championName")}
+            aliases = {p.get("riotId"), p.get("riotIdGameName"), p.get("summonerName")} - {None, ""}
+            for a in aliases:
+                self.roster[a] = info
+            if active_player_name in aliases:
+                self.my_names = aliases
+                self.my_team = info["team"]
 
     def ingest(self, stats: dict, events: dict) -> LeagueSnapshot:
         """Fold raw Riot /gamestats + /eventdata into a LeagueSnapshot.
@@ -132,11 +169,14 @@ class LeagueModel(GameModel):
             if key in self.seen_event_ids:
                 continue
             self.seen_event_ids.add(key)
+            self.recent_events.append(ev)
             name = ev.get("EventName", "")
             self.seen_event_names.add(name)
             if name == "DragonKill" and ev.get("DragonType") != "Elder":
                 self.dragon_count += 1
                 self.last_dragon_time = ev.get("EventTime", self.clock)
+        self.recent_events = [e for e in self.recent_events
+                              if e.get("EventTime", self.clock) >= self.clock - RECENT_WINDOW]
         return LeagueSnapshot(
             clock_seconds=self.clock,
             seen_event_names=frozenset(self.seen_event_names),
@@ -154,3 +194,50 @@ class LeagueModel(GameModel):
                 self.reached_log.append(cp.title)
                 newly.append(cp)
         return newly
+
+    def recent_context(self) -> dict:
+        """Compact summary of the last RECENT_WINDOW seconds, for the coach.
+
+        Players are labelled by champion when known; anything else (turrets,
+        minions, monsters) keeps its raw Riot name. Objective "by" is
+        "ally" / "enemy" / "unknown" relative to the player's team.
+        """
+        deaths, takedowns, objectives = [], [], []
+        for ev in self.recent_events:
+            name = ev.get("EventName")
+            t = round(ev.get("EventTime", self.clock))
+            if name == "ChampionKill":
+                assisters = ev.get("Assisters", [])
+                if ev.get("VictimName") in self.my_names:
+                    deaths.append({"t": t, "killer": self._label(ev.get("KillerName")),
+                                   "assisters": [self._label(a) for a in assisters]})
+                elif ev.get("KillerName") in self.my_names or self.my_names & set(assisters):
+                    takedowns.append({"t": t, "victim": self._label(ev.get("VictimName"))})
+            elif name in _OBJECTIVES:
+                obj = {"t": t, "type": _OBJECTIVES[name], "by": self._side(ev)}
+                if ev.get("DragonType"):
+                    obj["detail"] = ev["DragonType"]
+                if ev.get("Stolen") == "True":
+                    obj["stolen"] = True
+                objectives.append(obj)
+        return {"t": round(self.clock), "my_deaths": deaths,
+                "my_takedowns": takedowns, "objectives": objectives}
+
+    def _label(self, name: str | None) -> str | None:
+        info = self.roster.get(name)
+        return info["champion"] if info else name
+
+    def _side(self, ev: dict) -> str:
+        """Which side took an objective, relative to the player."""
+        if self.my_team is None:
+            return "unknown"
+        # structures encode their owner (T1 = ORDER, T2 = CHAOS); the killer
+        # may be a minion, so the owner is the reliable signal
+        structure = ev.get("TurretKilled") or ev.get("InhibKilled") or ""
+        if "_T1_" in structure or "_T2_" in structure:
+            owner = "ORDER" if "_T1_" in structure else "CHAOS"
+            return "enemy" if owner == self.my_team else "ally"
+        info = self.roster.get(ev.get("KillerName"))
+        if not info:
+            return "unknown"
+        return "ally" if info["team"] == self.my_team else "enemy"

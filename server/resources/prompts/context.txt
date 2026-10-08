@@ -8,10 +8,4 @@ Guidelines:
 - Assume the player knows how to play; coach at a macro/decision level
 - Factor in game time: early (<15min) = farm/setup, mid (15-25min) = objectives, late (>25min) = close out
 
-Always respond with valid JSON matching this exact schema:
-{
-  "priority": "<what to focus on RIGHT NOW, one short phrase>",
-  "action": "<specific action to take next, one sentence>",
-  "reasoning": "<why, one sentence>",
-  "warning": "<threat or risk to watch for, or null>"
-}
+Always respond with valid JSON matching exactly the schema given in each message.

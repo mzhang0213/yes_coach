@@ -24,7 +24,7 @@ class OverlayModel:
 
     def record_press(self, button: str):
         """Record that a UI button crossed its activation threshold, timestamped."""
-        self.presses.append({"button": button, "time": time.time()})
+        self.game.actions.append({"button": button, "time": time.time()})
 
     def update_quick_actions(self, new_actions:list[str]):
         self.quick_actions = new_actions

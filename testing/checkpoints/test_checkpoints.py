@@ -106,6 +106,98 @@ def test_hardcoded_checkpoints_present():
     }
 
 
+# ── recent_context ─────────────────────────────────────────────────────────
+
+ROSTER = [
+    {"riotId": "Me#NA1", "riotIdGameName": "Me", "summonerName": "Me",
+     "championName": "Ahri", "team": "ORDER"},
+    {"riotId": "Buddy#NA1", "riotIdGameName": "Buddy", "summonerName": "Buddy",
+     "championName": "Vi", "team": "ORDER"},
+    {"riotId": "Foe#EUW", "riotIdGameName": "Foe", "summonerName": "Foe",
+     "championName": "Zed", "team": "CHAOS"},
+    {"riotId": "Jungler#EUW", "riotIdGameName": "Jungler", "summonerName": "Jungler",
+     "championName": "Lee Sin", "team": "CHAOS"},
+]
+
+
+def rostered_model():
+    m = LeagueModel()
+    m.set_roster("Me#NA1", ROSTER)
+    return m
+
+
+def test_recent_context_death_labels_champions():
+    m = rostered_model()
+    m.ingest({"gameTime": 500.0}, {"Events": [
+        {"EventID": 1, "EventName": "ChampionKill", "EventTime": 480.0,
+         "KillerName": "Foe", "VictimName": "Me", "Assisters": ["Jungler"]},
+    ]})
+    ctx = m.recent_context()
+    assert ctx["t"] == 500
+    assert ctx["my_deaths"] == [{"t": 480, "killer": "Zed", "assisters": ["Lee Sin"]}]
+    assert ctx["my_takedowns"] == []
+
+
+def test_recent_context_takedown_as_assister():
+    m = rostered_model()
+    m.ingest({"gameTime": 500.0}, {"Events": [
+        {"EventID": 1, "EventName": "ChampionKill", "EventTime": 490.0,
+         "KillerName": "Buddy", "VictimName": "Foe", "Assisters": ["Me"]},
+        {"EventID": 2, "EventName": "ChampionKill", "EventTime": 495.0,  # not involved
+         "KillerName": "Buddy", "VictimName": "Jungler", "Assisters": []},
+    ]})
+    ctx = m.recent_context()
+    assert ctx["my_takedowns"] == [{"t": 490, "victim": "Zed"}]
+    assert ctx["my_deaths"] == []
+
+
+def test_recent_context_window_prunes_old_events():
+    m = rostered_model()
+    feed = {"Events": [
+        {"EventID": 1, "EventName": "ChampionKill", "EventTime": 100.0,
+         "KillerName": "Foe", "VictimName": "Me", "Assisters": []},
+    ]}
+    m.ingest({"gameTime": 120.0}, feed)
+    assert len(m.recent_context()["my_deaths"]) == 1
+    m.ingest({"gameTime": 161.0}, feed)                # 61 s later, same full feed
+    assert m.recent_context()["my_deaths"] == []       # pruned and not re-added
+
+
+def test_recent_context_objective_sides():
+    m = rostered_model()
+    m.ingest({"gameTime": 900.0}, {"Events": [
+        {"EventID": 1, "EventName": "DragonKill", "EventTime": 870.0,
+         "DragonType": "Fire", "Stolen": "False", "KillerName": "Jungler", "Assisters": []},
+        {"EventID": 2, "EventName": "BaronKill", "EventTime": 880.0,
+         "Stolen": "True", "KillerName": "Buddy", "Assisters": []},
+        # our (T1 = ORDER) turret falls to a minion → enemy took it
+        {"EventID": 3, "EventName": "TurretKilled", "EventTime": 890.0,
+         "TurretKilled": "Turret_T1_C_05_A", "KillerName": "Minion_T200L0S16N0040"},
+        {"EventID": 4, "EventName": "InhibKilled", "EventTime": 895.0,
+         "InhibKilled": "Barracks_T2_L1", "KillerName": "Me"},
+    ]})
+    objs = m.recent_context()["objectives"]
+    assert objs == [
+        {"t": 870, "type": "dragon", "by": "enemy", "detail": "Fire"},
+        {"t": 880, "type": "baron", "by": "ally", "stolen": True},
+        {"t": 890, "type": "turret", "by": "enemy"},
+        {"t": 895, "type": "inhib", "by": "ally"},
+    ], objs
+
+
+def test_recent_context_without_roster():
+    m = LeagueModel()                                  # roster never set
+    m.ingest({"gameTime": 500.0}, {"Events": [
+        {"EventID": 1, "EventName": "ChampionKill", "EventTime": 480.0,
+         "KillerName": "Foe", "VictimName": "Me", "Assisters": []},
+        {"EventID": 2, "EventName": "DragonKill", "EventTime": 490.0,
+         "DragonType": "Water", "KillerName": "Foe"},
+    ]})
+    ctx = m.recent_context()
+    assert ctx["my_deaths"] == []                      # can't tell who "me" is
+    assert ctx["objectives"] == [{"t": 490, "type": "dragon", "by": "unknown", "detail": "Water"}]
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0

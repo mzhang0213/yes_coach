@@ -19,6 +19,7 @@ print(response.message.content)
 load_dotenv()
 
 from google import genai
+from google.genai import types
 
 from server.resources.riot import (
     get_active_player,
@@ -97,8 +98,8 @@ def load_memory() -> tuple[list[dict], dict]:
         return [], {}
 
     prior_context = [
-        {"role": "user",  "parts": [f"Summary of my last game: {json.dumps(last_game)}"]},
-        {"role": "model", "parts": ["Got it. I'll keep that in mind for this session."]},
+        {"role": "user",  "parts": [{"text": f"Summary of my last game: {json.dumps(last_game)}"}]},
+        {"role": "model", "parts": [{"text": "Got it. I'll keep that in mind for this session."}]},
     ]
     return prior_context, last_game
 
@@ -125,20 +126,26 @@ class LoLCoach:
         self._init_client()
 
     def _init_client(self):
-        """Configure SDK with the next key and open a fresh chat session."""
-        genai.configure(api_key=next(self._keys))
-        model = genai.GenerativeModel(
-            model_name=self._model_name,
-            system_instruction=self._system,
-            generation_config=genai.GenerationConfig(
+        """Build a client with the next key and open a chat session.
+
+        On key rotation the existing chat history is carried over, so the
+        coach keeps its in-game context.
+        """
+        history = self._chat.get_history() if getattr(self, "_chat", None) else self._prior_context
+        client = genai.Client(api_key=next(self._keys))
+        self._chat = client.chats.create(
+            model=self._model_name,
+            config=types.GenerateContentConfig(
+                system_instruction=self._system,
                 response_mime_type="application/json",
                 max_output_tokens=300,
                 temperature=0.4,
             ),
+            history=history,
         )
-        self._chat = model.start_chat(history=self._prior_context)
 
-    def _call(self, question: str | None, schema_key: str) -> dict:
+    def _call(self, question: str | None, schema_key: str,
+              context: dict | None = None, image: bytes | None = None) -> dict:
         """Build prompt, send to Gemini, parse and return JSON."""
         schema = SCHEMAS[schema_key]
         state  = compress_game_state()
@@ -147,33 +154,41 @@ class LoLCoach:
             f"schema:{json.dumps(schema, separators=(',',':'))} "
             f"state:{json.dumps(state, separators=(',',':'))}"
         )
+        if context:
+            prompt += f" context:{json.dumps(context, separators=(',',':'))}"
         if question:
             prompt += f" question:{question}"
 
-        response = self._chat.send_message(prompt)
+        message = prompt
+        if image:
+            message = [prompt, types.Part.from_bytes(data=image, mime_type="image/png")]
+
+        response = self._chat.send_message(message)
         return json.loads(response.text)
 
-    def get_advice(self, question: str = None, schema_key: str = "live") -> dict:
+    def get_advice(self, question: str = None, schema_key: str = "situation",
+                   context: dict = None, image: bytes = None) -> dict:
         """
         Fetch live state and return coaching JSON.
 
         Args:
             question:   optional free-text player question → uses "question" schema
-            schema_key: "live" | "question" | "event" | "post_game"
+            schema_key: "situation" | "question" | "suggest" | "event" | "post_game"
+            context:    optional extra facts (e.g. recent deaths/objectives) sent with the prompt
+            image:      optional PNG screenshot bytes for a vision call
         """
-        if question and schema_key == "live":
+        if question and schema_key == "situation":
             schema_key = "question"
-            #TODO: make suggested prompts / questions
 
         try:
-            return self._call(question, schema_key)
+            return self._call(question, schema_key, context, image)
         except Exception as e:
             err = str(e)
             # Rotate to next key on quota / rate-limit errors
             if "429" in err or "quota" in err.lower():
                 self._init_client()
                 try:
-                    return self._call(question, schema_key)
+                    return self._call(question, schema_key, context, image)
                 except Exception as e2:
                     err = str(e2)
             # Game client not reachable

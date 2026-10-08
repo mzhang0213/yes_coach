@@ -10,11 +10,16 @@ SCHEMAS: dict[str, dict] = {
         "warning":  "threat or risk to watch, or null",
     },
 
-    # # Player typed an explicit question
-    # "question": {
-    #     "answer":    "direct answer to the question (one or two sentences)",
-    #     "follow_up": "related thing to consider, or null",
-    # },
+    # Player asked an explicit question (typed or picked from suggestions)
+    "question": {
+        "answer":    "direct answer to the question (one or two sentences)",
+        "follow_up": "related thing to consider, or null",
+    },
+
+    # Guess why the player opened the coach and offer questions to ask
+    "suggest": {
+        "questions": ["up to 5 short questions (max 6 words each) the player most likely wants answered right now"],
+    },
 
     # Triggered by a game event (kill, death, dragon, baron, tower)
     "event": {
