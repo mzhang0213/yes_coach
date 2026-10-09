@@ -1,8 +1,12 @@
 import requests
+import urllib3
 
 ###RIOT API INTEGRATION
 
 BASE = "https://127.0.0.1:2999/liveclientdata"
+
+# the Live Client API uses a self-signed cert on localhost, hence verify=False below
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 def make_get_req(path: str, params: dict = None) -> dict | list | str:

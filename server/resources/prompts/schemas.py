@@ -18,7 +18,16 @@ SCHEMAS: dict[str, dict] = {
 
     # Guess why the player opened the coach and offer questions to ask
     "suggest": {
-        "questions": ["up to 5 short questions (max 6 words each) the player most likely wants answered right now"],
+        "questions": ["up to 3 short questions (max 6 words each) the player would ask, in their own voice "
+                      "('How's my CS?', 'Do we have lane prio?'), neutral and open, never stating a "
+                      "problem or verdict ('Why is your CS so low?') — the diagnosis belongs in the answer. "
+                      "Specific to this moment: not the generic 'What should I do / where should I be / "
+                      "what should I buy' (those are always offered)"],
+    },
+
+    # Detail for a tip bubble (headline + rule-written facts given in the question)
+    "tip": {
+        "detail": "one or two sentences: the specific thing to do now, using the numbers in state/context",
     },
 
     # Triggered by a game event (kill, death, dragon, baron, tower)

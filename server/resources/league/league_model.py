@@ -108,6 +108,11 @@ CHECKPOINTS = [
 ]
 
 RECENT_WINDOW = 60.0  # seconds of game time kept for recent_context()
+LLM_SUGGESTION_TTL = 30.0  # game s a Gemini question list stays on offer after it was generated
+
+# dragon timers (game s) — sent to the coach so it doesn't guess spawn times
+FIRST_DRAGON_S = 5 * 60
+DRAGON_RESPAWN_S = 5 * 60
 
 # Riot event name → objective label used in recent_context()
 _OBJECTIVES = {
@@ -119,9 +124,100 @@ _OBJECTIVES = {
     "InhibKilled": "inhib",
 }
 
+# tips — thresholds (game s / per minute / gold)
+CS_CHECK_FROM_S = 5 * 60    # don't judge CS/min before this
+CS_PER_MIN_LOW = 5.0        # below → "CS is low" (skipped for supports)
+GOLD_UNSPENT = 1500         # at or above → "Gold to spend"
+DRAGON_HEADS_UP_S = 45      # "Dragon at m:ss" this long before it spawns
+CHECKPOINT_TIP_TTL = 90     # checkpoint tips stay up this long after the moment they mark
+
+# enemy objective (recent_context type) → (headline, rule-written detail). Baron/herald/grubs/inhib
+# come from CHECKPOINTS instead, so they aren't tipped twice.
+_EVENT_TIPS = {
+    "dragon": ("Enemy took dragon",
+               "Don't fight a buffed team head-on — trade for a turret, grubs or a side wave elsewhere."),
+    "turret": ("Lost a turret",
+               "That lane is now exposed. Don't farm it alone under the next turret — group or swap lanes."),
+}
+
+# checkpoint title → (priority, bubble category, headline, rule-written detail)
+_CHECKPOINT_TIPS = {
+    "15 min ff":         (1, "macro", "Surrender vote open",
+                          "/ff is available. If you're behind, play for picks and side waves instead of coin-flip fights."),
+    "void grubs spawn":  (3, "objective", "Void Grubs are up",
+                          "Shove your lane so you can help your jungler take grubs — or ward to see if the enemy starts them."),
+    "rift herald spawn": (3, "objective", "Rift Herald is up",
+                          "Herald lets you crash a turret. Shove first, then group with your jungler top side."),
+    "first baron spawn": (4, "objective", "Baron is up",
+                          "Get vision around the pit. Only start it when the enemy is down members or far away."),
+    "first inhib":       (3, "macro", "First inhibitor down",
+                          "Super minions now push that lane. Use the pressure to take objectives elsewhere — or collapse to defend."),
+    "void grubs taken":  (2, "macro", "Grubs taken",
+                          "If your team has them, push a side lane — they speed up turret damage. If not, expect pressure there."),
+    "rift herald taken": (2, "macro", "Herald taken",
+                          "Expect it to be released on a turret soon — be ready to defend or follow up."),
+    "baron taken":       (5, "macro", "Baron taken",
+                          "With it: group and siege. Against it: clear waves near your base and don't fight in the open."),
+    "elder spawn":       (5, "objective", "Elder Dragon is up",
+                          "Elder executes low-HP enemies. Set up vision early and don't let the enemy start it for free."),
+}
+
+GENERIC_QUESTIONS = ["What should I do now?", "Where should I be now?", "What should I buy next?"]
+
+# (objective, side that took it) → suggested question
+_OBJECTIVE_QUESTIONS = {
+    ("dragon", "enemy"): "Should I have contested dragon?",
+    ("dragon", "ally"):  "What do we do after dragon?",
+    ("baron", "enemy"):  "How do we defend baron push?",
+    ("baron", "ally"):   "How do we use baron?",
+    ("herald", "enemy"): "Should I have contested herald?",
+    ("herald", "ally"):  "Where should we use herald?",
+    ("grubs", "enemy"):  "Should I have contested grubs?",
+    ("grubs", "ally"):   "What do we do after grubs?",
+    ("turret", "enemy"): "What now after losing that turret?",
+    ("turret", "ally"):  "Where do I go after turret?",
+    ("inhib", "enemy"):  "How do we defend our base?",
+    ("inhib", "ally"):   "How do we close the game?",
+}
+
+
+def _mmss(seconds: float) -> str:
+    seconds = int(seconds)
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def suggest_questions(ctx: dict, limit: int = 5) -> list[str]:
+    """Rule-based questions the player probably wants answered, most specific first.
+
+    Takes recent_context() output. Always returns `limit` questions, padded
+    with generic ones.
+    """
+    qs = []
+    if ctx["my_deaths"]:
+        last = ctx["my_deaths"][-1]
+        qs.append("Why did I die?")
+        if len(last["assisters"]) >= 2:
+            qs.append("Was I caught out of position?")
+        elif (last["killer"] or "").startswith("Turret"):
+            qs.append("Should I have dived there?")
+        else:
+            qs.append("Could I have won that fight?")
+    for obj in reversed(ctx["objectives"]):  # newest first
+        q = _OBJECTIVE_QUESTIONS.get((obj["type"], obj["by"]))
+        if q and q not in qs:
+            qs.append(q)
+    if ctx["my_takedowns"]:
+        qs.append("How do I use this lead?")
+    for q in GENERIC_QUESTIONS:
+        if q not in qs:
+            qs.append(q)
+    return qs[:limit]
+
+
 class LeagueModel(GameModel):
     def __init__(self):
         super().__init__(CHECKPOINTS, [])
+        self.pinned_questions = list(GENERIC_QUESTIONS)
 
         # accumulators for folding the raw Riot event feed into snapshots
         self.seen_event_ids = set()
@@ -138,6 +234,12 @@ class LeagueModel(GameModel):
         self.my_team: str | None = None
         self.roster: dict[str, dict] = {}  # any name alias → {"team", "champion"}
 
+        # background suggestions: ingest() sets suggest_trigger to a fresh event
+        # worth reacting to (my death / an objective); the controller consumes it,
+        # and its worker writes llm_suggestions = (event game time, [questions])
+        self.suggest_trigger: dict | None = None
+        self.llm_suggestions: tuple[float, list[str]] | None = None
+
     def set_roster(self, active_player_name: str, players: list[dict]):
         """Learn who the player is and every player's team/champion.
 
@@ -148,7 +250,7 @@ class LeagueModel(GameModel):
         self.roster = {}
         self.my_names = set()
         for p in players:
-            info = {"team": p.get("team"), "champion": p.get("championName")}
+            info = {"team": p.get("team"), "champion": p.get("championName"), "position": p.get("position", "")}
             aliases = {p.get("riotId"), p.get("riotIdGameName"), p.get("summonerName")} - {None, ""}
             for a in aliases:
                 self.roster[a] = info
@@ -171,6 +273,9 @@ class LeagueModel(GameModel):
             self.seen_event_ids.add(key)
             self.recent_events.append(ev)
             name = ev.get("EventName", "")
+            if ((name in _OBJECTIVES or (name == "ChampionKill" and ev.get("VictimName") in self.my_names))
+                    and ev.get("EventTime", self.clock) >= self.clock - RECENT_WINDOW):
+                self.suggest_trigger = ev
             self.seen_event_names.add(name)
             if name == "DragonKill" and ev.get("DragonType") != "Elder":
                 self.dragon_count += 1
@@ -222,6 +327,138 @@ class LeagueModel(GameModel):
                 objectives.append(obj)
         return {"t": round(self.clock), "my_deaths": deaths,
                 "my_takedowns": takedowns, "objectives": objectives}
+
+    def state_lines(self) -> list[str]:
+        """Readable lines for the overlay's state toast: live_state (polled from the
+        Riot API — the same fields the coach gets) + the recent-events window."""
+        s = self.live_state
+        if s is None:
+            return ["Riot API · no live game"]
+        champ = next((self.roster[n]["champion"] for n in self.my_names if n in self.roster), None)
+        lines = [
+            f"Riot API · {_mmss(s['t'])} · {s['mode']}",
+            f"{champ or '?'} · lvl {s['lvl']} · {s['g']}g",
+            f"HP {s['hp']}/{s['mhp']}   MP {s['mp']}/{s['mmp']}",
+            f"KDA {s['k']}/{s['d']}/{s['a']}   CS {s['cs']}",
+            f"AD {s['ad']}   AP {s['ap']}",
+        ]
+        ctx = self.recent_context()
+        recent = [(d["t"], f"died to {d['killer']}" + (f" +{len(d['assisters'])}" if d["assisters"] else ""))
+                  for d in ctx["my_deaths"]]
+        recent += [(d["t"], f"killed {d['victim']}") for d in ctx["my_takedowns"]]
+        recent += [(o["t"], " ".join(filter(None, [o["by"], o.get("detail", "").lower(), o["type"],
+                                                   "(stolen)" if o.get("stolen") else ""])))
+                   for o in ctx["objectives"]]
+        lines.append(f"Last {int(RECENT_WINDOW)}s:" + ("" if recent else " quiet"))
+        lines += [f"  {_mmss(t)}  {text}" for t, text in sorted(recent)]
+        return lines
+
+    def coach_context(self) -> dict:
+        """recent_context() plus what the coach needs to stay in the present: the
+        clock as m:ss and the next dragon (from the event feed, not guessed)."""
+        ctx = {"clock": _mmss(self.clock), **self.recent_context()}
+        spawn = self._next_dragon_spawn()
+        if spawn is not None:
+            ctx["dragon"] = "alive now" if self.clock >= spawn else f"spawns at {_mmss(spawn)}"
+        return ctx
+
+    def _next_dragon_spawn(self) -> float | None:
+        """Game s the next elemental dragon spawns (may be past = alive), or None
+        after 4 drakes — soul/elder rules apply there and aren't modelled."""
+        if self.dragon_count >= 4:
+            return None
+        return FIRST_DRAGON_S if self.last_dragon_time is None else self.last_dragon_time + DRAGON_RESPAWN_S
+
+    # ── tips ──
+    def update_tips(self) -> list:
+        """Offer / clear tips from live stats, the dragon timer and recent events.
+        Call after ingest(); returns the newly offered Tips."""
+        now, new = self.clock, []
+        self.expire_tips(now)
+
+        def offer(*args, ttl, category):
+            tip = self.offer_tip(*args, now=now, ttl=ttl, category=category)
+            if tip:
+                new.append(tip)
+
+        s = self.live_state
+        if s:
+            me = next((self.roster[n] for n in self.my_names if n in self.roster), {})
+            minutes = now / 60
+            cpm = s["cs"] / minutes if minutes else 0
+            if now >= CS_CHECK_FROM_S and me.get("position") != "UTILITY" and cpm < CS_PER_MIN_LOW:
+                offer("cs_low", "CS is low",
+                      f"{s['cs']} CS at {_mmss(now)} — {cpm:.1f}/min. Aim for 7+: last-hit every wave "
+                      f"before you roam and catch side waves.", 1, ttl=120, category="farm")
+            elif cpm >= CS_PER_MIN_LOW + 0.5:
+                self.clear_tip("cs_low", now)
+            if s["g"] >= GOLD_UNSPENT:
+                offer("gold", "Gold to spend",
+                      f"{s['g']}g unspent. Next time your wave is pushed, recall and buy your next item.",
+                      1, ttl=120, category="economy")
+            elif s["g"] < GOLD_UNSPENT - 500:
+                self.clear_tip("gold", now)
+
+        spawn = self._next_dragon_spawn()
+        if spawn is not None and 0 < spawn - now <= DRAGON_HEADS_UP_S:
+            offer(f"dragon_soon@{round(spawn)}", f"Dragon at {_mmss(spawn)}",
+                  f"Dragon spawns in ~{round(spawn - now)}s. Shove your wave and move toward the pit "
+                  f"with your team so you get there first.", 5, ttl=spawn - now + 30,
+                  category="objective")
+
+        ctx = self.recent_context()
+        for d in ctx["my_deaths"]:
+            killers = " + ".join(filter(None, [d["killer"], *d["assisters"]]))
+            offer(f"death@{d['t']}", "Why you died",
+                  f"Died to {killers} at {_mmss(d['t'])}. Before stepping up, check where the enemy "
+                  f"jungler was last seen and whether your wave was pushed.", 4, ttl=d["t"] + 60 - now,
+                  category="death")
+        for o in ctx["objectives"]:
+            if o["by"] == "enemy" and o["type"] in _EVENT_TIPS:
+                headline, detail = _EVENT_TIPS[o["type"]]
+                offer(f"{o['type']}@{o['t']}", headline, detail, 4, ttl=o["t"] + 60 - now, category="macro")
+        return new
+
+    def checkpoint_tip(self, cp: Checkpoint):
+        """Turn a fired checkpoint into a tip — unless it happened a while ago
+        (e.g. launching mid-game fires every past checkpoint at once)."""
+        if cp.title not in _CHECKPOINT_TIPS:
+            return None
+        if isinstance(cp, ElderCheckpoint) and self.dragon_count < 4:
+            return None  # elder needs soul first; ElderCheckpoint alone ignores that
+        happened = self._checkpoint_time(cp)
+        if happened is None or self.clock - happened > CHECKPOINT_TIP_TTL:
+            return None
+        priority, category, headline, detail = _CHECKPOINT_TIPS[cp.title]
+        return self.offer_tip(f"cp:{cp.title}", headline, detail, priority, category=category,
+                              now=self.clock, ttl=happened + CHECKPOINT_TIP_TTL - self.clock)
+
+    def _checkpoint_time(self, cp: Checkpoint) -> float | None:
+        if isinstance(cp, ClockCheckpoint):
+            return cp.indicator
+        if isinstance(cp, ElderCheckpoint):
+            return None if self.last_dragon_time is None else self.last_dragon_time + cp.indicator
+        if isinstance(cp, EventCheckpoint):  # latest such event still in the recent window
+            times = [e.get("EventTime", self.clock) for e in self.recent_events
+                     if e.get("EventName") == cp.indicator]
+            return max(times) if times else None
+        return None
+
+    def current_suggestions(self, limit: int = 3) -> list[str]:
+        """Questions to offer right now: up to `limit` about the situation (fresh
+        background LLM ones first, then rules), then the always-there pinned_questions.
+        llm_suggestions is (game time generated, questions)."""
+        qs = []
+        if self.llm_suggestions and self.clock - self.llm_suggestions[0] <= LLM_SUGGESTION_TTL:
+            qs = list(self.llm_suggestions[1])
+        qs += suggest_questions(self.recent_context())
+        seen = {q.lower() for q in self.pinned_questions}
+        situational = []
+        for q in qs:
+            if q.lower() not in seen:
+                situational.append(q)
+                seen.add(q.lower())
+        return situational[:limit] + self.pinned_questions
 
     def _label(self, name: str | None) -> str | None:
         info = self.roster.get(name)

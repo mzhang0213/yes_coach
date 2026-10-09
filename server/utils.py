@@ -14,6 +14,7 @@ import time
 import platform
 import threading
 from queue import Queue
+from collections import deque
 
 import logging
 
@@ -156,14 +157,24 @@ class ScreenCapture:
         self.latest_process_frame = None
         self.display_lock = threading.Lock()
         self.process_lock = threading.Lock()
+        # rolling history of downscaled JPEGs: (wall time, bytes), oldest first
+        self.history = deque()
+        self.history_seconds = 0
+        self.frame_interval = 0.01
+        self._warned_black = False
 
-    def start_capture(self, process_callback=None, process_interval=1.0):
+    def start_capture(self, process_callback=None, process_interval=1.0,
+                      history_seconds=0, frame_interval=0.01):
+        """history_seconds > 0 keeps that many seconds of frames for frame_at();
+        frame_interval is the sleep between grabs (raise it to save CPU)."""
         if self.running:
             print("Screen capture is already running.")
             return False
 
         self.process_callback = process_callback
         self.process_interval = process_interval
+        self.history_seconds = history_seconds
+        self.frame_interval = frame_interval
         self.running = True
 
         self.capture_thread = threading.Thread(target=self.capturing, daemon=True)
@@ -211,6 +222,9 @@ class ScreenCapture:
 
                         current_time = time.time()
 
+                        if self.history_seconds:
+                            self._record_history(frame, current_time)
+
                         # Update display frame at ~30 FPS (main thread will consume)
                         if current_time - last_display_time > display_interval:
                             with self.display_lock:
@@ -231,7 +245,7 @@ class ScreenCapture:
                             ).start()
 
                         frame_count += 1
-                        time.sleep(0.01)
+                        time.sleep(self.frame_interval)
 
                     except Exception as e:
                         print(f"Error during capture: {str(e)}")
@@ -248,6 +262,35 @@ class ScreenCapture:
             print(f"\nCapture thread finished. Captured {frame_count} frames.")
             if elapsed > 0:
                 print(f"Total time: {elapsed:.2f}s, Average FPS: {frame_count/elapsed:.2f}")
+
+    def _record_history(self, frame, t, max_width=1280):
+        # all-black frames usually mean macOS Screen Recording permission is missing
+        if frame.max() < 8:
+            if not self._warned_black:
+                print("[capture] black frames — grant Screen Recording permission in System Settings > Privacy")
+                self._warned_black = True
+            return
+        h, w = frame.shape[:2]
+        if w > max_width:
+            frame = cv.resize(frame, (max_width, int(h * max_width / w)), interpolation=cv.INTER_AREA)
+        ok, buf = cv.imencode(".jpg", frame, [cv.IMWRITE_JPEG_QUALITY, 80])
+        if not ok:
+            return
+        with self.frame_lock:
+            self.history.append((t, buf.tobytes()))
+            while self.history and self.history[0][0] < t - self.history_seconds:
+                self.history.popleft()
+
+    def frame_at(self, wall_time):
+        """Latest JPEG captured at or before wall_time (oldest if earlier than
+        the buffer), or None if nothing is buffered."""
+        with self.frame_lock:
+            best = self.history[0][1] if self.history else None
+            for t, jpg in self.history:
+                if t > wall_time:
+                    break
+                best = jpg
+            return best
 
     def callback(self, frame):
         try:

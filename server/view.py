@@ -4,15 +4,46 @@ Renders application state (CoachModel) onto a transparent, always-on-top
 overlay, plus the auxiliary region-picker and prompt widgets. Pure
 presentation: holds no game logic and never mutates the model.
 """
+import math
 import os
+import time
 
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget,
                              QLabel, QLineEdit, QPushButton, QVBoxLayout)
 from PyQt6.QtCore import Qt, QRect, QRectF, QEventLoop
 from PyQt6.QtGui import (QPainter, QPen, QColor, QBrush, QFont,
-                         QLinearGradient, QRadialGradient, QPainterPath, QPixmap)
+                         QLinearGradient, QRadialGradient, QPainterPath, QPixmap, QFontMetrics)
 
 from server.utils import SCREEN_SIZE, app
+
+# coach panel layout (screen pixels)
+PANEL_W = 380
+PANEL_PAD = 12
+ICON_SIZE = 44     # round Gemini-logo button; doubles as the panel's top-left corner
+ICON_INSET = 6     # logo's offset from the panel corner when open
+ROW_H = 34
+ROW_GAP = 6
+DIVIDER_GAP = 14   # extra space where the thin rule sits between situational and pinned questions
+FILL_STEP = 0.019  # hover-fill per frame (~0.85 s at 16 ms ticks)
+TOAST_MARGIN = 16           # state toast: top-left corner offset
+TOAST_PAD = 8
+TOAST_LINE_H = 15
+BUBBLE_D = 88               # tip bubbles (circles) beside the open panel
+BUBBLE_GAP = 14             # panel edge → bubble area
+# scattered slot offsets (dx out from the panel, dy down from its top) — spread out, not a list
+BUBBLE_SLOTS = [(4, -8), (100, 92), (16, 200)]
+# bubble colour per tip category — five spread-out hues around the colour wheel
+BUBBLE_COLORS = {
+    'death':     (255, 84, 104),   # coral red
+    'objective': (255, 176, 46),   # amber
+    'farm':      (64, 214, 120),   # green
+    'economy':   (56, 168, 255),   # sky blue
+    'macro':     (168, 92, 255),   # violet
+}
+MAX_BUBBLES = 3
+BUBBLE_FILL_STEP = 0.04     # pops in ~0.4 s — faster than buttons
+CARD_W = 280                # popped tip's detail card
+CARD_LEAVE_FRAMES = 20      # card closes once the cursor has been off it this long (~0.3 s)
 
 
 class ButtonPlacer(QWidget):
@@ -185,19 +216,31 @@ class OverlayView(QMainWindow):
         self.text_boxes = []
         self.gemini_buttons = []
         self.tab_buttons = []
+        self.panels = []
+        self.labels = []
+        self.rows = []
+        self.spinners = []
+        self.icon_buttons = []
 
         # ── interaction state (the view owns button positions + animations) ──
-        # idle → filling → unfurled → closing → cooldown → idle
+        # idle → open → cooldown → idle. What the open panel shows (analyzing /
+        # suggestions / answering / answer) is derived from model data in render().
         self.button_pos = None
         self.state = 'idle'
-        self.has_left = False  # cursor left all buttons since unfurl
-        self.compl = 0.0  # main-button hover-fill
-        self.left_compls = [0.0, 0.0, 0.0, 0.0, 0.0]
-        self.right_compl = 0.0
+        self.fills = {}  # hover-fill per target name ('open', 'close', 'suggest:0', …)
+        self._close_armed = False  # re-hovering the logo closes only after the cursor left it once
+        self.tip_slots: dict[int, int] = {}  # tip id → bubble slot, so bubbles never shift under the cursor
+        self.card_slot = 0                   # slot the open detail card grew from
+        self._card_away = 0                  # frames the cursor has been off the card
+        self.bubbles = []
+        self.cards = []
+        self.dividers = []
 
         # load notebook icon once
         icon_path = os.path.join(os.path.dirname(__file__), 'notebook_icon.png')
         self.notebook_icon = QPixmap(icon_path) if os.path.exists(icon_path) else None
+        gemini_path = os.path.join(os.path.dirname(__file__), 'gemini_icon.png')
+        self.gemini_icon = QPixmap(gemini_path) if os.path.exists(gemini_path) else None
 
         self.resize(SCREEN_SIZE[0], SCREEN_SIZE[1])
         self.show()
@@ -206,6 +249,23 @@ class OverlayView(QMainWindow):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
+        for panel in self.panels:
+            self._paint_panel(painter, panel)
+        for row in self.rows:
+            self._paint_row(painter, row)
+        painter.setPen(QPen(QColor(255, 255, 255, 45), 1))
+        for x1, y1, x2 in self.dividers:
+            painter.drawLine(x1, y1, x2, y1)
+        for label in self.labels:
+            self._paint_label(painter, label)
+        for spinner in self.spinners:
+            self._paint_spinner(painter, spinner)
+        for icon_btn in self.icon_buttons:
+            self._paint_icon_button(painter, icon_btn)
+        for bubble in self.bubbles:
+            self._paint_bubble(painter, bubble)
+        for card in self.cards:
+            self._paint_card(painter, card)
 
         for i,box in enumerate(self.text_boxes):
             x, y, text, color, font_size = box
@@ -653,176 +713,415 @@ class OverlayView(QMainWindow):
 
         return
 
-    def render(self, model) -> dict | None:
-        """Draw the current frame from the view's own interaction state.
+    @staticmethod
+    def _font(size: int, bold: bool = False) -> QFont:
+        font = QFont('Arial', size)
+        font.setBold(bold)
+        return font
 
-        Draws the main button (always) and, when unfurled/closing, the side
-        tabs — reading fill/state from self and the tab labels (quick_actions)
-        from the model. Returns the on-screen geometry the controller needs for
-        hit-testing, or None if there is nothing to draw yet.
+    @classmethod
+    def _wrapped_height(cls, text: str, w: int, size: int, bold: bool = False) -> int:
+        fm = QFontMetrics(cls._font(size, bold))
+        return fm.boundingRect(QRect(0, 0, w, 10000), Qt.TextFlag.TextWordWrap.value, text).height()
+
+    def _paint_panel(self, painter: QPainter, d: dict):
+        radius = d.get('radius', 12)
+        painter.setPen(QPen(QColor(255, 255, 255, 40), 1))
+        painter.setBrush(QBrush(QColor(18, 18, 26, 230)))
+        painter.drawRoundedRect(QRectF(d['x'], d['y'], d['w'], d['h']), radius, radius)
+
+    def _paint_label(self, painter: QPainter, d: dict):
+        painter.setFont(self._font(d['size'], d.get('bold', False)))
+        painter.setPen(QColor(*d.get('color', (255, 255, 255))))
+        align = Qt.AlignmentFlag.AlignVCenter if d.get('vcenter') else Qt.AlignmentFlag.AlignTop
+        painter.drawText(QRectF(d['x'], d['y'], d['w'], d['h']),
+                         Qt.TextFlag.TextWordWrap.value | align.value, d['text'])
+
+    def _paint_row(self, painter: QPainter, d: dict):
+        """A full-width suggestion row; hover-fill sweeps left → right."""
+        x, y, w, h = d['x'], d['y'], d['w'], d['h']
+        path = QPainterPath()
+        path.addRoundedRect(QRectF(x, y, w, h), 8, 8)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(QColor(255, 255, 255, 22)))
+        painter.drawPath(path)
+
+        if d['completion'] > 0.0:
+            painter.save()
+            painter.setClipPath(path)
+            grad = QLinearGradient(x, y, x + w, y)
+            grad.setColorAt(0.0, QColor(55, 115, 230, 170))
+            grad.setColorAt(0.5, QColor(150, 70, 220, 170))
+            grad.setColorAt(1.0, QColor(235, 90, 140, 170))
+            painter.setBrush(QBrush(grad))
+            painter.drawRect(QRectF(x, y, w * min(d['completion'], 1.0), h))
+            painter.restore()
+
+        font = self._font(11, True)
+        painter.setFont(font)
+        painter.setPen(QColor(255, 255, 255))
+        text = QFontMetrics(font).elidedText(d['text'], Qt.TextElideMode.ElideRight, w - 24)
+        painter.drawText(QRectF(x + 12, y, w - 24, h), Qt.AlignmentFlag.AlignVCenter, text)
+
+    def _paint_spinner(self, painter: QPainter, d: dict):
+        cx, cy, r = d['cx'], d['cy'], d['r']
+        start = int(time.monotonic() * 360) % 360
+        pen = QPen(QColor(180, 140, 255), 3)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawArc(QRectF(cx - r, cy - r, 2 * r, 2 * r), -start * 16, 270 * 16)
+
+    def _paint_icon_button(self, painter: QPainter, d: dict):
+        """Round Gemini-logo button: Gemini-gradient disc, bright rim, radial bloom on hover-fill."""
+        x, y, size = d['x'], d['y'], d['size']
+        rect = QRectF(x, y, size, size)
+        path = QPainterPath()
+        path.addEllipse(rect)
+        grad = QLinearGradient(rect.topLeft(), rect.bottomRight())  # same stops as the old pill
+        grad.setColorAt(0.0, QColor(55, 115, 230))
+        grad.setColorAt(0.35, QColor(120, 75, 220))
+        grad.setColorAt(0.65, QColor(190, 60, 220))
+        grad.setColorAt(1.0, QColor(235, 90, 140))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(grad))
+        painter.drawPath(path)
+
+        if d['completion'] > 0.0:
+            painter.save()
+            painter.setClipPath(path)
+            cx, cy = x + size / 2, y + size / 2
+            r = math.hypot(size / 2, size / 2) * min(d['completion'], 1.0)
+            bloom = QRadialGradient(cx, cy, r)
+            bloom.setColorAt(0.0, QColor(255, 255, 255, 90))
+            bloom.setColorAt(0.6, QColor(200, 170, 255, 70))
+            bloom.setColorAt(1.0, QColor(200, 170, 255, 0))
+            painter.setBrush(QBrush(bloom))
+            painter.drawEllipse(QRectF(cx - r, cy - r, r * 2, r * 2))
+            painter.restore()
+
+        rim = QLinearGradient(rect.topLeft(), rect.bottomRight())
+        rim.setColorAt(0.0, QColor(100, 160, 255, 160))
+        rim.setColorAt(0.5, QColor(180, 120, 255, 160))
+        rim.setColorAt(1.0, QColor(255, 120, 180, 160))
+        painter.setPen(QPen(QBrush(rim), 1.5))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawEllipse(rect.adjusted(1, 1, -1, -1))
+
+        if self.gemini_icon:
+            icon = int(size * 0.58)
+            painter.drawPixmap(int(x + (size - icon) / 2), int(y + (size - icon) / 2), icon, icon, self.gemini_icon)
+
+    def _paint_bubble(self, painter: QPainter, d: dict):
+        """Glossy filled bubble, no border: colour body lit from the top-left, a soft
+        sheen at the rim, a specular highlight. Hover-fill swells and brightens it
+        until it pops."""
+        c = min(d['completion'], 1.0)
+        size = d['size'] * (1 + 0.08 * c)                 # swells as it fills
+        x = d['x'] - (size - d['size']) / 2
+        y = d['y'] - (size - d['size']) / 2
+        r = size / 2
+        cx, cy = x + r, y + r
+        rgb = d['color']
+
+        def mix(f):  # f > 0 → toward white, f < 0 → toward black
+            return QColor(*[int(v + (255 - v) * f) if f > 0 else int(v * (1 + f)) for v in rgb])
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        body = QRadialGradient(cx - 0.3 * r, cy - 0.35 * r, 1.25 * r)
+        body.setColorAt(0.0, mix(0.45 + 0.3 * c))
+        body.setColorAt(0.55, mix(0.08 * c))
+        body.setColorAt(1.0, mix(-0.35))
+        painter.setBrush(QBrush(body))
+        painter.drawEllipse(QRectF(x, y, size, size))
+
+        sheen = QRadialGradient(cx, cy, r)                 # bright film at the edge, no stroke
+        sheen.setColorAt(0.78, QColor(255, 255, 255, 0))
+        sheen.setColorAt(0.97, QColor(255, 255, 255, 70))
+        sheen.setColorAt(1.0, QColor(255, 255, 255, 0))
+        painter.setBrush(QBrush(sheen))
+        painter.drawEllipse(QRectF(x, y, size, size))
+
+        painter.save()                                     # specular highlight, tilted
+        painter.translate(x + 0.32 * size, y + 0.22 * size)
+        painter.rotate(-35)
+        hw, hh = 0.36 * size, 0.2 * size
+        spec = QRadialGradient(0, 0, hw / 2)
+        spec.setColorAt(0.0, QColor(255, 255, 255, 210))
+        spec.setColorAt(1.0, QColor(255, 255, 255, 0))
+        painter.setBrush(QBrush(spec))
+        painter.drawEllipse(QRectF(-hw / 2, -hh / 2, hw, hh))
+        painter.restore()
+        painter.setBrush(QBrush(QColor(255, 255, 255, 90)))  # small glint, lower right
+        painter.drawEllipse(QRectF(x + 0.7 * size, y + 0.7 * size, 0.08 * size, 0.08 * size))
+
+        inset = size * 0.14
+        rect = QRectF(x + inset, y + size * 0.22, size - 2 * inset, size * 0.56)
+        flags = (Qt.TextFlag.TextWordWrap.value | Qt.AlignmentFlag.AlignHCenter.value
+                 | Qt.AlignmentFlag.AlignVCenter.value)
+        painter.setFont(self._font(10, True))
+        painter.setPen(QColor(0, 0, 0, 120))               # shadow keeps white text readable on light hues
+        painter.drawText(rect.translated(0, 1), flags, d['text'])
+        painter.setPen(QColor(255, 255, 255))
+        painter.drawText(rect, flags, d['text'])
+
+    def _paint_card(self, painter: QPainter, d: dict):
+        """Popped tip: headline + detail on a panel with the gradient rim."""
+        x, y, w, h = d['x'], d['y'], d['w'], d['h']
+        rect = QRectF(x, y, w, h)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(QColor(18, 18, 26, 240)))
+        painter.drawRoundedRect(rect, 12, 12)
+        rim = QLinearGradient(x, y, x + w, y + h)
+        rim.setColorAt(0.0, QColor(100, 160, 255, 190))
+        rim.setColorAt(0.5, QColor(180, 120, 255, 190))
+        rim.setColorAt(1.0, QColor(255, 120, 180, 190))
+        painter.setPen(QPen(QBrush(rim), 1.5))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(rect.adjusted(0.75, 0.75, -0.75, -0.75), 12, 12)
+        inner = w - 2 * PANEL_PAD
+        wrap = Qt.TextFlag.TextWordWrap.value
+        painter.setFont(self._font(11, True))
+        painter.setPen(QColor(255, 255, 255))
+        painter.drawText(QRectF(x + PANEL_PAD, y + PANEL_PAD, inner, d['head_h']), wrap, d['headline'])
+        painter.setFont(self._font(10))
+        painter.setPen(QColor(220, 220, 232))
+        painter.drawText(QRectF(x + PANEL_PAD, y + PANEL_PAD + d['head_h'] + 6, inner, h), wrap, d['detail'])
+
+    def _panel_button(self, name: str, cx: int, cy: int, w: int = 26,
+                      text: str | None = None, icon: QPixmap | None = None) -> tuple:
+        tl, br = self.draw_tab_button(cx, cy, w, 26, text=text, icon=icon, bg=(70, 70, 88),
+                                      completion=self.fills.get(name, 0.0))
+        return (*tl, *br)
+
+    def render(self, model) -> dict | None:
+        """Draw the current frame from the view's interaction state + model data.
+
+        Closed: just the round Gemini-logo button. Open: a panel with the logo in its
+        top-left corner (re-hover it to close); what it shows depends on the model —
+            game.suggestions is None          → analyzing (spinner + Cancel)
+            game.question is None             → suggestion list
+            game.question, game.answer None   → answering (question + spinner + Cancel)
+            game.question, game.answer        → answer
+        While open, tip bubbles float beside the panel; a popped tip (game.open_tip)
+        shows as a detail card where its bubble was.
+        Returns hit-test geometry: {'main': logo box, 'buttons': {name: box}, 'rows': [box],
+        'tips': {tip id: box}, 'card': box | None}, or None if there is nothing to draw yet.
         """
         self.clearCanvas()
         if not self.button_pos:
             return None
+        game = model.game
+        geom = {'main': None, 'buttons': {}, 'rows': [], 'tips': {}, 'card': None}
+        self._render_state_toast(game)
 
-        # always draw main button
-        (bx1, by1), (bx2, by2) = self.draw_gemini_button(
-            "Ask Coach!!", x=self.button_pos['x'], y=self.button_pos['y'],
-            completion=self.compl,
-        )
+        cx = int(SCREEN_SIZE[0] * self.button_pos['x'])
+        cy = int(SCREEN_SIZE[1] * self.button_pos['y'])
+        ix, iy = cx - ICON_SIZE // 2, cy - ICON_SIZE // 2
+        geom['main'] = (ix, iy, ix + ICON_SIZE, iy + ICON_SIZE)
 
-        # checkpoint status — re-emitted every frame since clearCanvas() wiped it
-        if model.game.status:
-            self.draw_status(model.game.status)
+        if self.state == 'open':
+            px, py, ph = self._render_panel(game, ix, iy, geom)
+            self._render_tips(game, px, py, ph, geom)
+        else:
+            self.tip_slots = {}
+            self.icon_buttons.append({'x': ix, 'y': iy, 'size': ICON_SIZE,
+                                      'completion': self.fills.get('open', 0.0)})
+        return geom
 
-        left_boxes = []
-        right_box = None
+    def _render_state_toast(self, game):
+        """Persistent top-left box: the game state the client reads from the Riot API."""
+        lines = game.state_lines()
+        if not lines:
+            return
+        fm_head, fm = QFontMetrics(self._font(10, True)), QFontMetrics(self._font(10))
+        w = max([fm_head.horizontalAdvance(lines[0])] + [fm.horizontalAdvance(l) for l in lines[1:]])
+        w += 2 * TOAST_PAD
+        x, y = TOAST_MARGIN, TOAST_MARGIN
+        self.panels.append({'x': x, 'y': y, 'w': w, 'h': len(lines) * TOAST_LINE_H + 2 * TOAST_PAD - 2,
+                            'radius': 8})
+        for i, line in enumerate(lines):
+            self.labels.append({'x': x + TOAST_PAD, 'y': y + TOAST_PAD + i * TOAST_LINE_H, 'w': w, 'h': TOAST_LINE_H,
+                                'text': line, 'size': 10, 'bold': i == 0,
+                                'color': (170, 170, 190) if i == 0 else (235, 235, 245)})
 
-        if self.state in ('unfurled', 'closing'):
-            main_w = bx2 - bx1
-            main_h = by2 - by1
-            main_cy = (by1 + by2) // 2
+    def _render_panel(self, game, ix: int, iy: int, geom: dict):
+        """Panel opening right/down from the logo, which sits in its top-left
+        corner: analyzing, suggestions, a pending question, or the answer."""
+        inner = PANEL_W - 2 * PANEL_PAD
+        if game.suggestions is None:
+            mode, title, body_h = 'analyzing', 'Analyzing…', 0
+        elif game.question is None:
+            mode, title = 'suggest', 'Ask about…'
+            # thin rule before the pinned questions, if there are situational ones above them
+            split = len(game.suggestions) - len(game.pinned_questions)
+            split = split if 0 < split < len(game.suggestions) else None
+            body_h = max(len(game.suggestions) * (ROW_H + ROW_GAP) - ROW_GAP, 0) + (DIVIDER_GAP if split else 0)
+        else:
+            mode = 'answering' if game.answer is None else 'answer'
+            title = 'Coach'
+            q_h = self._wrapped_height(game.question, inner, 12, True)
+            a_h = self._wrapped_height(game.answer, inner, 11) if mode == 'answer' else 20
+            body_h = q_h + 8 + a_h
+        header_h = ICON_INSET + ICON_SIZE
+        h = header_h + (8 + body_h if body_h else ICON_INSET) + (PANEL_PAD if body_h else 0)
 
-            # tab sizing
-            tab_h = int(main_h * 0.82)
-            tab_w = int(main_w * 0.65)
-            tab_w_right = tab_h  # square for icon-only
-            gap = 10
-            tab_gap = 5
+        # logo stays put; the panel is only nudged if it would run off-screen
+        x = max(10, min(ix - ICON_INSET, SCREEN_SIZE[0] - PANEL_W - 10))
+        y = max(10, min(iy - ICON_INSET, SCREEN_SIZE[1] - h - 10))
+        self.panels.append({'x': x, 'y': y, 'w': PANEL_W, 'h': h})
+        lx, ly = x + ICON_INSET, y + ICON_INSET
+        self.icon_buttons.append({'x': lx, 'y': ly, 'size': ICON_SIZE, 'completion': self.fills.get('close', 0.0)})
+        geom['main'] = (lx, ly, lx + ICON_SIZE, ly + ICON_SIZE)  # re-hover the logo to close
 
-            frozen = self.state == 'closing'
+        # header: [logo] title ............ buttons
+        hcy = y + ICON_INSET + ICON_SIZE // 2
+        tx = x + ICON_INSET + ICON_SIZE + 10
+        if mode == 'analyzing':
+            self.spinners.append({'cx': tx + 8, 'cy': hcy, 'r': 7})
+            tx += 24
+        self.labels.append({'x': tx, 'y': hcy - 13, 'w': x + PANEL_W - tx, 'h': 26, 'text': title,
+                            'size': 12 if mode == 'analyzing' else 10, 'bold': True,
+                            'color': (255, 255, 255) if mode == 'analyzing' else (170, 170, 190),
+                            'vcenter': True})
+        buttons = []
+        if mode == 'suggest':
+            buttons.append(('prompt', 26, None if self.notebook_icon else '✎', self.notebook_icon))
+        elif mode in ('answering', 'analyzing'):
+            buttons.append(('cancel', 70, 'Cancel', None))
+        else:  # answer is in → move on to the next question
+            buttons.append(('next', 26, '→', None))
+        bx = x + PANEL_W - PANEL_PAD
+        for name, w, text, icon in buttons:
+            bx -= w
+            geom['buttons'][name] = self._panel_button(name, bx + w // 2, hcy, w=w, text=text, icon=icon)
+            bx -= 6
 
-            # ── left action tabs (fanned around the left perimeter) ──
-            # 5 fixed slots on a left-facing arc: the middle slot bulges out
-            # furthest, top/bottom sit near the button edge. Actions fill the
-            # slots top-down, one by one.
-            import math
-            n_slots = len(self.left_compls)
-            total_left_h = n_slots * tab_h + (n_slots - 1) * tab_gap
-            left_top = main_cy - total_left_h // 2
-            left_base_cx = bx1 - gap - tab_w // 2  # x of the top/bottom slots
-            bulge = int(tab_w * 0.9)               # leftward push at the middle slot
+        top = y + header_h + 8
+        if mode == 'analyzing':
+            return x, y, h
+        if mode == 'suggest':
+            for i, q in enumerate(game.suggestions):
+                ry = top + i * (ROW_H + ROW_GAP) + (DIVIDER_GAP if split and i >= split else 0)
+                if i == split:
+                    ly = ry - ROW_GAP // 2 - DIVIDER_GAP // 2
+                    self.dividers.append((x + PANEL_PAD + 8, ly, x + PANEL_W - PANEL_PAD - 8))
+                self.rows.append({'x': x + PANEL_PAD, 'y': ry, 'w': inner, 'h': ROW_H, 'text': q,
+                                  'completion': self.fills.get(f'suggest:{i}', 0.0)})
+                geom['rows'].append((x + PANEL_PAD, ry, x + PANEL_PAD + inner, ry + ROW_H))
+            return x, y, h
 
-            for i in range(min(len(model.game.quick_actions), n_slots)):
-                frac = i / (n_slots - 1)           # 0 (top) .. 1 (bottom)
-                ty = left_top + i * (tab_h + tab_gap) + tab_h // 2
-                tx = left_base_cx - int(bulge * math.sin(frac * math.pi))
-                box = self.draw_tab_button(
-                    tx, ty, tab_w, tab_h,
-                    text=model.game.quick_actions[i], bg=(50, 100, 190),
-                    completion=0.0 if frozen else self.left_compls[i],
-                )
-                left_boxes.append((*box[0], *box[1]))
+        self.labels.append({'x': x + PANEL_PAD, 'y': top, 'w': inner, 'h': q_h,
+                            'text': game.question, 'size': 12, 'bold': True})
+        ay = top + q_h + 8
+        if mode == 'answering':
+            self.spinners.append({'cx': x + PANEL_PAD + 9, 'cy': ay + 10, 'r': 7})
+            self.labels.append({'x': x + PANEL_PAD + 26, 'y': ay, 'w': inner - 26, 'h': 20,
+                                'text': 'Thinking…', 'size': 11, 'color': (180, 180, 195), 'vcenter': True})
+        else:
+            self.labels.append({'x': x + PANEL_PAD, 'y': ay, 'w': inner, 'h': a_h,
+                                'text': game.answer, 'size': 11})
+        return x, y, h
 
-            # ── right tab ──
-            right_cx = bx2 + gap + tab_w_right // 2
-            rbox = self.draw_tab_button(
-                right_cx, main_cy, tab_w_right, tab_h,
-                icon=self.notebook_icon, bg=(180, 180, 180),
-                completion=0.0 if frozen else self.right_compl,
-            )
-            right_box = (*rbox[0], *rbox[1])
+    def _render_tips(self, game, px: int, py: int, ph: int, geom: dict):
+        """Tip bubbles stacked beside the panel (right side, or left if no room),
+        bobbing gently. Each tip keeps its slot while it lives; new tips fill free
+        slots in priority order. The popped tip's card grows from its slot and
+        hides the bubbles until it closes."""
+        live = {t.id: t for t in game.tips_on_offer()}
+        self.tip_slots = {tid: slot for tid, slot in self.tip_slots.items() if tid in live}
+        free = [s for s in range(MAX_BUBBLES) if s not in self.tip_slots.values()]
+        for tid in live:
+            if not free:
+                break
+            if tid not in self.tip_slots:
+                self.tip_slots[tid] = free.pop(0)
 
-        return {'main': (bx1, by1, bx2, by2), 'left': left_boxes, 'right': right_box}
+        # side is chosen with room for a card too, so bubbles don't jump sides when one pops
+        widest = max(max(dx for dx, _ in BUBBLE_SLOTS) + BUBBLE_D, CARD_W)
+        right = px + PANEL_W + BUBBLE_GAP + widest <= SCREEN_SIZE[0] - 10
+        t = time.monotonic()
+
+        def slot_y(slot):
+            return py + BUBBLE_SLOTS[slot][1]
+
+        # while a card is open the bubbles step aside (they'd sit under it and pop by accident)
+        for tid, slot in ([] if game.open_tip else self.tip_slots.items()):
+            dx = BUBBLE_SLOTS[slot][0]
+            bx = px + PANEL_W + BUBBLE_GAP + dx if right else px - BUBBLE_GAP - BUBBLE_D - dx
+            bx = int(bx + 3 * math.sin(t * 1.3 + slot * 2.1))               # drift
+            by = int(slot_y(slot) + 5 * math.sin(t * 2.0 + slot * 1.7))     # float
+            self.bubbles.append({'x': bx, 'y': by, 'size': BUBBLE_D, 'text': live[tid].headline,
+                                 'color': BUBBLE_COLORS.get(live[tid].category, BUBBLE_COLORS['macro']),
+                                 'completion': self.fills.get(f'tip:{tid}', 0.0)})
+            geom['tips'][tid] = (bx, by, bx + BUBBLE_D, by + BUBBLE_D)
+
+        tip = game.open_tip
+        if tip:
+            inner = CARD_W - 2 * PANEL_PAD
+            head_h = self._wrapped_height(tip.headline, inner, 11, True)
+            body_h = self._wrapped_height(tip.detail, inner, 10)
+            h = PANEL_PAD + head_h + 6 + body_h + PANEL_PAD
+            cx = px + PANEL_W + BUBBLE_GAP if right else max(10, px - BUBBLE_GAP - CARD_W)
+            cy = max(10, min(slot_y(self.card_slot), SCREEN_SIZE[1] - h - 10))
+            self.cards.append({'x': cx, 'y': cy, 'w': CARD_W, 'h': h, 'headline': tip.headline,
+                               'detail': tip.detail, 'head_h': head_h})
+            geom['card'] = (cx, cy, cx + CARD_W, cy + h)
 
     def advance(self, hover: dict) -> str | None:
-        """Advance button-fill animations and the interaction state machine one frame.
+        """Advance hover-fills and the interaction state machine one frame.
 
-        State: idle → filling → unfurled → closing → cooldown → idle
-            idle:     main button only
-            filling:  hovering main button, bloom rising
-            unfurled: side tabs visible
-            closing:  re-hover bloom on main button, tabs frozen, completes → cooldown
-            cooldown: wait for cursor to leave main button before allowing re-trigger
+        State: idle → open → cooldown → idle
+            idle:     pill only; hover-filling it opens the panel
+            open:     panel targets (buttons / suggestion rows) fill on hover; re-hovering
+                      the logo (once the cursor has left it) closes
+            cooldown: after close, wait for the cursor to leave the logo
 
         Args:
-            hover: {'main': bool, 'left': list[bool], 'right': bool} — which buttons
-                   the cursor is over this frame (from the controller's hit-test).
+            hover: {'main': bool, 'buttons': {name: bool}, 'rows': [bool]} — what the
+                   cursor is over this frame (from the controller's hit-test).
         Returns:
-            The id of a button that just crossed its activation threshold this frame
-            ('left:0'..'left:2' or 'right'), or None. Main-button open/close are
-            internal transitions and report no press.
+            The target that just finished filling — 'open', 'close', 'cancel',
+            'prompt', 'next' or 'suggest:<i>' — or None.
         """
-        on_main = hover['main']
-        press = None
+        if self.state == 'cooldown':
+            self.fills = {}
+            if not hover['main']:
+                self.state = 'idle'
+            return None
 
-        # ── idle ──────────────────────────────────────────────
         if self.state == 'idle':
-            if on_main:
-                self.state = 'filling'
-                self.compl = 0.019
+            targets = {'open': hover['main']}
+        else:
+            if not hover['main']:
+                self._close_armed = True
+            targets = {'close': hover['main'] and self._close_armed, **hover['buttons']}
+            targets.update({f'suggest:{i}': over for i, over in enumerate(hover['rows'])})
+            targets.update({f'tip:{tid}': over for tid, over in hover['tips'].items()})
 
-        # ── filling ───────────────────────────────────────────
-        elif self.state == 'filling':
-            if on_main:
-                if int(self.compl * 100) / 100 >= 0.98:
-                    self.state = 'unfurled'
-                    self.compl = 1.0
-                    self.has_left = False
-                elif self.compl <= 1.0:
-                    self.compl += 0.019
-            else:
-                self.state = 'idle'
-                self.compl = 0.0
+        press = None
+        fills = {}
+        for name, over in targets.items():
+            step = BUBBLE_FILL_STEP if name.startswith('tip:') else FILL_STEP
+            fill = self.fills.get(name, 0.0) + step if over else 0.0
+            if fill >= 0.98:
+                press, fill = name, 0.0
+            fills[name] = fill
+        self.fills = fills  # targets that vanished this frame drop their fill
 
-        # ── unfurled ──────────────────────────────────────────
-        elif self.state == 'unfurled':
-            self.compl = 0.0
-
-            # ── hover logic ──
-            on_any = on_main
-            for i, over in enumerate(hover['left']):
-                if over:
-                    on_any = True
-                    if int(self.left_compls[i] * 100) / 100 >= 0.98:
-                        press = f'left:{i}'
-                        self.left_compls[i] = 0.0
-                    elif self.left_compls[i] <= 1.0:
-                        self.left_compls[i] += 0.019
-                else:
-                    self.left_compls[i] = 0.0
-
-            if hover['right']:
-                on_any = True
-                if int(self.right_compl * 100) / 100 >= 0.98:
-                    press = 'right'
-                    self.right_compl = 0.0
-                elif self.right_compl <= 1.0:
-                    self.right_compl += 0.019
-            else:
-                self.right_compl = 0.0
-
-            if not on_any:
-                self.has_left = True
-
-            # re-hover on OG after leaving → start close animation
-            if self.has_left and on_main:
-                self.state = 'closing'
-                self.compl = 0.0
-                self.left_compls = [0.0, 0.0, 0.0, 0.0, 0.0]
-                self.right_compl = 0.0
-
-        # ── closing ──────────────────────────────────────────
-        elif self.state == 'closing':
-            # bloom on main button to confirm close
-            if on_main:
-                if int(self.compl * 100) / 100 >= 0.98:
-                    self.state = 'cooldown'
-                    self.compl = 0.0
-                    self.has_left = False
-                elif self.compl <= 1.0:
-                    self.compl += 0.019
-            else:
-                # moved off main → cancel close, back to unfurled
-                self.state = 'unfurled'
-                self.compl = 1.0
-
-        # ── cooldown ─────────────────────────────────────────
-        elif self.state == 'cooldown':
-            # wait for cursor to leave main button before re-enabling
-            if not on_main:
-                self.state = 'idle'
-
+        if press == 'open':
+            self.state = 'open'
+            self._close_armed = False
+        elif press == 'close':
+            self.state = 'cooldown'
+        elif press and press.startswith('tip:'):
+            self.card_slot = self.tip_slots.pop(int(press.split(':')[1]), 0)
+            self._card_away = 0   # cursor starts on the card (it grows from the bubble)
+        elif press is None and self.state == 'open' and self.cards:
+            # detail card: close once the cursor has been off it for a moment
+            self._card_away = 0 if hover['card'] else self._card_away + 1
+            if self._card_away >= CARD_LEAVE_FRAMES:
+                press = 'tip_close'
         return press
 
     def clearCanvas(self):
@@ -833,6 +1132,14 @@ class OverlayView(QMainWindow):
         self.text_boxes.clear()
         self.gemini_buttons.clear()
         self.tab_buttons.clear()
+        self.panels.clear()
+        self.labels.clear()
+        self.rows.clear()
+        self.spinners.clear()
+        self.icon_buttons.clear()
+        self.bubbles.clear()
+        self.cards.clear()
+        self.dividers.clear()
         self.update()  # Trigger repaint
 
     def hideCanvas(self):
