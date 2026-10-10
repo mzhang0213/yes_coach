@@ -244,12 +244,17 @@ class LoLCoach:
         # screenshots go with their own request but aren't replayed later.
         self._history, self.last_game = load_memory()
 
+    def new_session(self):
+        """New game: forget this game's chat (keeps the last-game summary from memory)."""
+        self._history, self.last_game = load_memory()
+
     def _call(self, question: str | None, schema_key: str,
               context: dict | None = None, image: bytes | None = None,
-              one_shot: bool = False) -> dict:
+              one_shot: bool = False, state: dict | None = None, max_tokens: int | None = None) -> dict:
         """Build prompt, send to the backend, parse and return JSON."""
         schema = SCHEMAS[schema_key]
-        state  = compress_game_state()
+        if state is None:
+            state = compress_game_state()
 
         prompt = (
             f"schema:{json.dumps(schema, separators=(',',':'))} "
@@ -262,14 +267,15 @@ class LoLCoach:
 
         # one-shot: no history — smaller request, faster reply, doesn't clutter the chat
         text = self._backend.generate(self._system, [] if one_shot else self._history,
-                                      prompt, image, 150 if one_shot else 300)
+                                      prompt, image, max_tokens or (150 if one_shot else 300))
         result = _parse_json(text)
         if not one_shot:
             self._history += [("user", prompt), ("assistant", text)]
         return result
 
     def get_advice(self, question: str = None, schema_key: str = "situation",
-                   context: dict = None, image: bytes = None, one_shot: bool = False) -> dict:
+                   context: dict = None, image: bytes = None, one_shot: bool = False,
+                   state: dict = None, max_tokens: int = None) -> dict:
         """
         Fetch live state and return coaching JSON.
 
@@ -279,19 +285,22 @@ class LoLCoach:
             context:    optional extra facts (e.g. recent deaths/objectives) sent with the prompt
             image:      optional JPEG screenshot bytes for a vision call
             one_shot:   send without chat history (fast, for quick suggestions)
+            state:      game state to send instead of the live one (e.g. champ select — the
+                        Live Client API doesn't exist yet)
+            max_tokens: reply budget override (default 150 one-shot / 300)
         """
         if question and schema_key == "situation":
             schema_key = "question"
 
         try:
-            return self._call(question, schema_key, context, image, one_shot)
+            return self._call(question, schema_key, context, image, one_shot, state, max_tokens)
         except Exception as e:
             err = str(e)
             # Rotate to next key on quota / rate-limit errors
             if "429" in err or "quota" in err.lower():
                 self._backend.rotate()
                 try:
-                    return self._call(question, schema_key, context, image, one_shot)
+                    return self._call(question, schema_key, context, image, one_shot, state, max_tokens)
                 except Exception as e2:
                     err = str(e2)
             # Game client (Riot API on :2999) or model server not reachable

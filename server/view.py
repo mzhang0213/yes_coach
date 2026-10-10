@@ -19,19 +19,25 @@ from server.utils import SCREEN_SIZE, app
 # coach panel layout (screen pixels)
 PANEL_W = 380
 PANEL_PAD = 12
-ICON_SIZE = 44     # round Gemini-logo button; doubles as the panel's top-left corner
+ICON_SIZE = 46     # round Gemini-logo button; doubles as the panel's top-left corner
 ICON_INSET = 6     # logo's offset from the panel corner when open
 ROW_H = 34
-ROW_GAP = 6
-DIVIDER_GAP = 14   # extra space where the thin rule sits between situational and pinned questions
-FILL_STEP = 0.019  # hover-fill per frame (~0.85 s at 16 ms ticks)
+ROW_GAP = 5
+ROW_FONT = 12
+BTN_H = 32         # header buttons (✎ / → / Cancel)
+QUESTION_ROWS = 5  # situational question slots; ones without a question show "--"
+DIVIDER_GAP = 14   # extra space where the thin rule sits between the slots and the pinned questions
+ACTION_COLOR = (255, 205, 110)  # highlighted "do this" line in answers and cards
+# hover-fill per frame (16 ms ticks)
+OPEN_FILL_STEP = 0.022    # logo open / close: ~0.75 s
+SELECT_FILL_STEP = 0.027  # questions + header buttons: ~0.6 s
 TOAST_MARGIN = 16           # state toast: top-left corner offset
 TOAST_PAD = 8
 TOAST_LINE_H = 15
-BUBBLE_D = 88               # tip bubbles (circles) beside the open panel
-BUBBLE_GAP = 14             # panel edge → bubble area
-# scattered slot offsets (dx out from the panel, dy down from its top) — spread out, not a list
-BUBBLE_SLOTS = [(4, -8), (100, 92), (16, 200)]
+BUBBLE_D = 70               # tip bubbles (circles) — always on, beside the logo or the open panel
+BUBBLE_GAP = 14             # logo / panel edge → bubble area
+# scattered slot offsets (dx out from the logo/panel, dy down from its top) — spread out, not a list
+BUBBLE_SLOTS = [(4, -6), (82, 74), (14, 156)]
 # bubble colour per tip category — five spread-out hues around the colour wheel
 BUBBLE_COLORS = {
     'death':     (255, 84, 104),   # coral red
@@ -40,10 +46,13 @@ BUBBLE_COLORS = {
     'economy':   (56, 168, 255),   # sky blue
     'macro':     (168, 92, 255),   # violet
 }
+# champ select categories reuse the wheel: loadout blue, our comp green, enemy comp red
+BUBBLE_COLORS.update(loadout=BUBBLE_COLORS['economy'], ally=BUBBLE_COLORS['farm'], enemy=BUBBLE_COLORS['death'])
 MAX_BUBBLES = 3
-BUBBLE_FILL_STEP = 0.04     # pops in ~0.4 s — faster than buttons
-CARD_W = 280                # popped tip's detail card
-CARD_LEAVE_FRAMES = 20      # card closes once the cursor has been off it this long (~0.3 s)
+BUBBLE_FILL_STEP = 0.03     # pops in ~0.55 s
+CARD_W = 300                # popped tip's card — stays until dismissed
+CARD_DISMISS_STEP = 0.055   # hover the card ~0.3 s to dismiss it
+AUTO_DISMISS_S = 10.0       # cards close / answers move on by themselves after this; a bar drains meanwhile
 
 
 class ButtonPlacer(QWidget):
@@ -231,7 +240,10 @@ class OverlayView(QMainWindow):
         self._close_armed = False  # re-hovering the logo closes only after the cursor left it once
         self.tip_slots: dict[int, int] = {}  # tip id → bubble slot, so bubbles never shift under the cursor
         self.card_slot = 0                   # slot the open detail card grew from
-        self._card_away = 0                  # frames the cursor has been off the card
+        self._card_armed = False             # dismiss-by-hover counts only after the cursor left the card once
+        # auto-dismiss: (what is showing, monotonic time it appeared) for the card / the answer
+        self._card_shown = (None, 0.0)
+        self._answer_shown = (None, 0.0)
         self.bubbles = []
         self.cards = []
         self.dividers = []
@@ -729,6 +741,16 @@ class OverlayView(QMainWindow):
         painter.setPen(QPen(QColor(255, 255, 255, 40), 1))
         painter.setBrush(QBrush(QColor(18, 18, 26, 230)))
         painter.drawRoundedRect(QRectF(d['x'], d['y'], d['w'], d['h']), radius, radius)
+        if d.get('countdown') is not None:
+            self._paint_countdown(painter, d['x'], d['y'], d['w'], d['h'], d['countdown'])
+
+    def _paint_countdown(self, painter: QPainter, x, y, w, h, remaining: float):
+        """Auto-dismiss indicator: a thin bar along the bottom edge, draining right → left."""
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(QColor(255, 255, 255, 25)))
+        painter.drawRoundedRect(QRectF(x + 12, y + h - 5, w - 24, 2), 1, 1)
+        painter.setBrush(QBrush(QColor(180, 150, 255, 170)))
+        painter.drawRoundedRect(QRectF(x + 12, y + h - 5, (w - 24) * max(remaining, 0.0), 2), 1, 1)
 
     def _paint_label(self, painter: QPainter, d: dict):
         painter.setFont(self._font(d['size'], d.get('bold', False)))
@@ -757,9 +779,9 @@ class OverlayView(QMainWindow):
             painter.drawRect(QRectF(x, y, w * min(d['completion'], 1.0), h))
             painter.restore()
 
-        font = self._font(11, True)
+        font = self._font(ROW_FONT, True)
         painter.setFont(font)
-        painter.setPen(QColor(255, 255, 255))
+        painter.setPen(QColor(110, 110, 125) if d.get('empty') else QColor(255, 255, 255))
         text = QFontMetrics(font).elidedText(d['text'], Qt.TextElideMode.ElideRight, w - 24)
         painter.drawText(QRectF(x + 12, y, w - 24, h), Qt.AlignmentFlag.AlignVCenter, text)
 
@@ -881,16 +903,28 @@ class OverlayView(QMainWindow):
         painter.drawRoundedRect(rect.adjusted(0.75, 0.75, -0.75, -0.75), 12, 12)
         inner = w - 2 * PANEL_PAD
         wrap = Qt.TextFlag.TextWordWrap.value
+        ty = y + PANEL_PAD
         painter.setFont(self._font(11, True))
-        painter.setPen(QColor(255, 255, 255))
-        painter.drawText(QRectF(x + PANEL_PAD, y + PANEL_PAD, inner, d['head_h']), wrap, d['headline'])
-        painter.setFont(self._font(10))
+        painter.setPen(QColor(*d['color']))                 # headline in its bubble's colour
+        painter.drawText(QRectF(x + PANEL_PAD, ty, inner, d['head_h']), wrap, d['headline'])
+        ty += d['head_h'] + 6
+        if d['action']:
+            painter.setFont(self._font(13, True))
+            painter.setPen(QColor(*ACTION_COLOR))
+            painter.drawText(QRectF(x + PANEL_PAD, ty, inner, d['act_h']), wrap, d['action'])
+            ty += d['act_h']
+        painter.setFont(self._font(11))
         painter.setPen(QColor(220, 220, 232))
-        painter.drawText(QRectF(x + PANEL_PAD, y + PANEL_PAD + d['head_h'] + 6, inner, h), wrap, d['detail'])
+        painter.drawText(QRectF(x + PANEL_PAD, ty, inner, h), wrap, d['detail'])
+        self._paint_countdown(painter, x, y, w, h, d['countdown'])
+        if d['completion'] > 0:                             # dismiss-by-hover progress
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(QColor(255, 255, 255, 150)))
+            painter.drawRoundedRect(QRectF(x + 12, y + h - 7, (w - 24) * min(d['completion'], 1.0), 3), 1.5, 1.5)
 
-    def _panel_button(self, name: str, cx: int, cy: int, w: int = 26,
+    def _panel_button(self, name: str, cx: int, cy: int, w: int = BTN_H,
                       text: str | None = None, icon: QPixmap | None = None) -> tuple:
-        tl, br = self.draw_tab_button(cx, cy, w, 26, text=text, icon=icon, bg=(70, 70, 88),
+        tl, br = self.draw_tab_button(cx, cy, w, BTN_H, text=text, icon=icon, bg=(70, 70, 88),
                                       completion=self.fills.get(name, 0.0))
         return (*tl, *br)
 
@@ -903,8 +937,8 @@ class OverlayView(QMainWindow):
             game.question is None             → suggestion list
             game.question, game.answer None   → answering (question + spinner + Cancel)
             game.question, game.answer        → answer
-        While open, tip bubbles float beside the panel; a popped tip (game.open_tip)
-        shows as a detail card where its bubble was.
+        Tip bubbles are always on, floating beside the logo (or the open panel); a popped
+        tip (game.open_tip) shows as a card where its bubble was, until hovered to dismiss.
         Returns hit-test geometry: {'main': logo box, 'buttons': {name: box}, 'rows': [box],
         'tips': {tip id: box}, 'card': box | None}, or None if there is nothing to draw yet.
         """
@@ -921,12 +955,12 @@ class OverlayView(QMainWindow):
         geom['main'] = (ix, iy, ix + ICON_SIZE, iy + ICON_SIZE)
 
         if self.state == 'open':
-            px, py, ph = self._render_panel(game, ix, iy, geom)
-            self._render_tips(game, px, py, ph, geom)
+            px, py, _ = self._render_panel(game, ix, iy, geom)
+            self._render_tips(game, px, py, PANEL_W, geom)
         else:
-            self.tip_slots = {}
             self.icon_buttons.append({'x': ix, 'y': iy, 'size': ICON_SIZE,
                                       'completion': self.fills.get('open', 0.0)})
+            self._render_tips(game, ix, iy, ICON_SIZE, geom)
         return geom
 
     def _render_state_toast(self, game):
@@ -953,23 +987,34 @@ class OverlayView(QMainWindow):
             mode, title, body_h = 'analyzing', 'Analyzing…', 0
         elif game.question is None:
             mode, title = 'suggest', 'Ask about…'
-            # thin rule before the pinned questions, if there are situational ones above them
-            split = len(game.suggestions) - len(game.pinned_questions)
-            split = split if 0 < split < len(game.suggestions) else None
-            body_h = max(len(game.suggestions) * (ROW_H + ROW_GAP) - ROW_GAP, 0) + (DIVIDER_GAP if split else 0)
+            pinned = game.pinned_questions
+            situational = game.suggestions[:len(game.suggestions) - len(pinned)]
+            n_rows = QUESTION_ROWS + len(pinned)
+            body_h = n_rows * (ROW_H + ROW_GAP) - ROW_GAP + (DIVIDER_GAP if pinned else 0)
         else:
             mode = 'answering' if game.answer is None else 'answer'
             title = 'Coach'
-            q_h = self._wrapped_height(game.question, inner, 12, True)
-            a_h = self._wrapped_height(game.answer, inner, 11) if mode == 'answer' else 20
-            body_h = q_h + 8 + a_h
+            q_h = self._wrapped_height(game.question, inner, 13, True)
+            if mode == 'answer':  # {"action": highlighted line (may be ""), "text": why / error}
+                act_h = self._wrapped_height(game.answer["action"], inner, 13, True) + 5 if game.answer["action"] else 0
+                a_h = act_h + self._wrapped_height(game.answer["text"], inner, 11)
+            else:
+                a_h = 24
+            body_h = q_h + 10 + a_h
         header_h = ICON_INSET + ICON_SIZE
         h = header_h + (8 + body_h if body_h else ICON_INSET) + (PANEL_PAD if body_h else 0)
 
         # logo stays put; the panel is only nudged if it would run off-screen
         x = max(10, min(ix - ICON_INSET, SCREEN_SIZE[0] - PANEL_W - 10))
         y = max(10, min(iy - ICON_INSET, SCREEN_SIZE[1] - h - 10))
-        self.panels.append({'x': x, 'y': y, 'w': PANEL_W, 'h': h})
+        countdown = None
+        if mode == 'answer':
+            if self._answer_shown[0] is not game.answer:
+                self._answer_shown = (game.answer, time.monotonic())
+            countdown = self._remaining(self._answer_shown[1])
+        else:
+            self._answer_shown = (None, 0.0)
+        self.panels.append({'x': x, 'y': y, 'w': PANEL_W, 'h': h, 'countdown': countdown})
         lx, ly = x + ICON_INSET, y + ICON_INSET
         self.icon_buttons.append({'x': lx, 'y': ly, 'size': ICON_SIZE, 'completion': self.fills.get('close', 0.0)})
         geom['main'] = (lx, ly, lx + ICON_SIZE, ly + ICON_SIZE)  # re-hover the logo to close
@@ -981,16 +1026,16 @@ class OverlayView(QMainWindow):
             self.spinners.append({'cx': tx + 8, 'cy': hcy, 'r': 7})
             tx += 24
         self.labels.append({'x': tx, 'y': hcy - 13, 'w': x + PANEL_W - tx, 'h': 26, 'text': title,
-                            'size': 12 if mode == 'analyzing' else 10, 'bold': True,
+                            'size': 13 if mode == 'analyzing' else 11, 'bold': True,
                             'color': (255, 255, 255) if mode == 'analyzing' else (170, 170, 190),
                             'vcenter': True})
         buttons = []
         if mode == 'suggest':
-            buttons.append(('prompt', 26, None if self.notebook_icon else '✎', self.notebook_icon))
+            buttons.append(('prompt', BTN_H, None if self.notebook_icon else '✎', self.notebook_icon))
         elif mode in ('answering', 'analyzing'):
-            buttons.append(('cancel', 70, 'Cancel', None))
+            buttons.append(('cancel', 84, 'Cancel', None))
         else:  # answer is in → move on to the next question
-            buttons.append(('next', 26, '→', None))
+            buttons.append(('next', BTN_H + 8, '→', None))
         bx = x + PANEL_W - PANEL_PAD
         for name, w, text, icon in buttons:
             bx -= w
@@ -1001,33 +1046,53 @@ class OverlayView(QMainWindow):
         if mode == 'analyzing':
             return x, y, h
         if mode == 'suggest':
-            for i, q in enumerate(game.suggestions):
-                ry = top + i * (ROW_H + ROW_GAP) + (DIVIDER_GAP if split and i >= split else 0)
-                if i == split:
+            # 5 situational slots ("--" when empty — not a target), divider, pinned questions.
+            # geom['rows'][k] is game.suggestions[k] (placeholders are skipped), so presses map 1:1.
+            for slot in range(n_rows):
+                ry = top + slot * (ROW_H + ROW_GAP) + (DIVIDER_GAP if slot >= QUESTION_ROWS else 0)
+                if slot == QUESTION_ROWS and pinned:
                     ly = ry - ROW_GAP // 2 - DIVIDER_GAP // 2
                     self.dividers.append((x + PANEL_PAD + 8, ly, x + PANEL_W - PANEL_PAD - 8))
-                self.rows.append({'x': x + PANEL_PAD, 'y': ry, 'w': inner, 'h': ROW_H, 'text': q,
+                if slot < QUESTION_ROWS:
+                    i = slot if slot < len(situational) else None
+                else:
+                    i = len(situational) + slot - QUESTION_ROWS
+                if i is None:
+                    self.rows.append({'x': x + PANEL_PAD, 'y': ry, 'w': inner, 'h': ROW_H,
+                                      'text': '--', 'completion': 0.0, 'empty': True})
+                    continue
+                self.rows.append({'x': x + PANEL_PAD, 'y': ry, 'w': inner, 'h': ROW_H,
+                                  'text': game.suggestions[i],
                                   'completion': self.fills.get(f'suggest:{i}', 0.0)})
                 geom['rows'].append((x + PANEL_PAD, ry, x + PANEL_PAD + inner, ry + ROW_H))
             return x, y, h
 
         self.labels.append({'x': x + PANEL_PAD, 'y': top, 'w': inner, 'h': q_h,
-                            'text': game.question, 'size': 12, 'bold': True})
-        ay = top + q_h + 8
+                            'text': game.question, 'size': 13, 'bold': True, 'color': (180, 180, 200)})
+        ay = top + q_h + 10
         if mode == 'answering':
-            self.spinners.append({'cx': x + PANEL_PAD + 9, 'cy': ay + 10, 'r': 7})
-            self.labels.append({'x': x + PANEL_PAD + 26, 'y': ay, 'w': inner - 26, 'h': 20,
-                                'text': 'Thinking…', 'size': 11, 'color': (180, 180, 195), 'vcenter': True})
+            self.spinners.append({'cx': x + PANEL_PAD + 10, 'cy': ay + 12, 'r': 8})
+            self.labels.append({'x': x + PANEL_PAD + 28, 'y': ay, 'w': inner - 28, 'h': 24,
+                                'text': 'Thinking…', 'size': 12, 'color': (180, 180, 195), 'vcenter': True})
         else:
+            if game.answer["action"]:
+                self.labels.append({'x': x + PANEL_PAD, 'y': ay, 'w': inner, 'h': act_h,
+                                    'text': game.answer["action"], 'size': 13, 'bold': True, 'color': ACTION_COLOR})
+                ay += act_h
             self.labels.append({'x': x + PANEL_PAD, 'y': ay, 'w': inner, 'h': a_h,
-                                'text': game.answer, 'size': 11})
+                                'text': game.answer["text"], 'size': 11})
         return x, y, h
 
-    def _render_tips(self, game, px: int, py: int, ph: int, geom: dict):
-        """Tip bubbles stacked beside the panel (right side, or left if no room),
-        bobbing gently. Each tip keeps its slot while it lives; new tips fill free
-        slots in priority order. The popped tip's card grows from its slot and
-        hides the bubbles until it closes."""
+    @staticmethod
+    def _remaining(shown_at: float) -> float:
+        """Fraction of AUTO_DISMISS_S left since shown_at (1 → 0)."""
+        return 1.0 - (time.monotonic() - shown_at) / AUTO_DISMISS_S
+
+    def _render_tips(self, game, px: int, py: int, pw: int, geom: dict):
+        """Tip bubbles scattered beside the anchor — the logo, or the open panel — at
+        (px, py) with width pw: right side, or left if no room; drifting gently. Each tip
+        keeps its slot while it lives; new tips fill free slots in priority order. The
+        popped tip's card grows from its slot and hides the bubbles until it's dismissed."""
         live = {t.id: t for t in game.tips_on_offer()}
         self.tip_slots = {tid: slot for tid, slot in self.tip_slots.items() if tid in live}
         free = [s for s in range(MAX_BUBBLES) if s not in self.tip_slots.values()]
@@ -1039,7 +1104,7 @@ class OverlayView(QMainWindow):
 
         # side is chosen with room for a card too, so bubbles don't jump sides when one pops
         widest = max(max(dx for dx, _ in BUBBLE_SLOTS) + BUBBLE_D, CARD_W)
-        right = px + PANEL_W + BUBBLE_GAP + widest <= SCREEN_SIZE[0] - 10
+        right = px + pw + BUBBLE_GAP + widest <= SCREEN_SIZE[0] - 10
         t = time.monotonic()
 
         def slot_y(slot):
@@ -1048,7 +1113,7 @@ class OverlayView(QMainWindow):
         # while a card is open the bubbles step aside (they'd sit under it and pop by accident)
         for tid, slot in ([] if game.open_tip else self.tip_slots.items()):
             dx = BUBBLE_SLOTS[slot][0]
-            bx = px + PANEL_W + BUBBLE_GAP + dx if right else px - BUBBLE_GAP - BUBBLE_D - dx
+            bx = px + pw + BUBBLE_GAP + dx if right else px - BUBBLE_GAP - BUBBLE_D - dx
             bx = int(bx + 3 * math.sin(t * 1.3 + slot * 2.1))               # drift
             by = int(slot_y(slot) + 5 * math.sin(t * 2.0 + slot * 1.7))     # float
             self.bubbles.append({'x': bx, 'y': by, 'size': BUBBLE_D, 'text': live[tid].headline,
@@ -1057,15 +1122,23 @@ class OverlayView(QMainWindow):
             geom['tips'][tid] = (bx, by, bx + BUBBLE_D, by + BUBBLE_D)
 
         tip = game.open_tip
+        if not tip:
+            self._card_shown = (None, 0.0)
         if tip:
             inner = CARD_W - 2 * PANEL_PAD
             head_h = self._wrapped_height(tip.headline, inner, 11, True)
-            body_h = self._wrapped_height(tip.detail, inner, 10)
-            h = PANEL_PAD + head_h + 6 + body_h + PANEL_PAD
-            cx = px + PANEL_W + BUBBLE_GAP if right else max(10, px - BUBBLE_GAP - CARD_W)
+            act_h = self._wrapped_height(tip.action, inner, 13, True) + 6 if tip.action else 0
+            body_h = self._wrapped_height(tip.detail, inner, 11)
+            h = PANEL_PAD + head_h + 6 + act_h + body_h + PANEL_PAD + 4
+            cx = px + pw + BUBBLE_GAP if right else max(10, px - BUBBLE_GAP - CARD_W)
             cy = max(10, min(slot_y(self.card_slot), SCREEN_SIZE[1] - h - 10))
+            if self._card_shown[0] != tip.id:
+                self._card_shown = (tip.id, time.monotonic())
             self.cards.append({'x': cx, 'y': cy, 'w': CARD_W, 'h': h, 'headline': tip.headline,
-                               'detail': tip.detail, 'head_h': head_h})
+                               'action': tip.action, 'detail': tip.detail, 'head_h': head_h, 'act_h': act_h,
+                               'color': BUBBLE_COLORS.get(tip.category, BUBBLE_COLORS['macro']),
+                               'completion': self.fills.get('tip_close', 0.0),
+                               'countdown': self._remaining(self._card_shown[1])})
             geom['card'] = (cx, cy, cx + CARD_W, cy + h)
 
     def advance(self, hover: dict) -> str | None:
@@ -1077,12 +1150,16 @@ class OverlayView(QMainWindow):
                       the logo (once the cursor has left it) closes
             cooldown: after close, wait for the cursor to leave the logo
 
+        Tip bubbles and the card work in idle and open: hover a bubble to pop it, hover
+        the card (once the cursor has left it) to dismiss it.
+
         Args:
-            hover: {'main': bool, 'buttons': {name: bool}, 'rows': [bool]} — what the
-                   cursor is over this frame (from the controller's hit-test).
+            hover: {'main': bool, 'buttons': {name: bool}, 'rows': [bool], 'tips': {id: bool},
+                   'card': bool} — what the cursor is over this frame (controller's hit-test).
         Returns:
-            The target that just finished filling — 'open', 'close', 'cancel',
-            'prompt', 'next' or 'suggest:<i>' — or None.
+            The target that just finished filling — 'open', 'close', 'cancel', 'prompt',
+            'next', 'suggest:<i>', 'tip:<id>' or 'tip_close' — or None. Cards and answers
+            also time out after AUTO_DISMISS_S ('tip_close' / 'next').
         """
         if self.state == 'cooldown':
             self.fills = {}
@@ -1097,12 +1174,17 @@ class OverlayView(QMainWindow):
                 self._close_armed = True
             targets = {'close': hover['main'] and self._close_armed, **hover['buttons']}
             targets.update({f'suggest:{i}': over for i, over in enumerate(hover['rows'])})
-            targets.update({f'tip:{tid}': over for tid, over in hover['tips'].items()})
+        targets.update({f'tip:{tid}': over for tid, over in hover['tips'].items()})
+        if self.cards:
+            if not hover['card']:
+                self._card_armed = True
+            targets['tip_close'] = hover['card'] and self._card_armed
 
         press = None
         fills = {}
         for name, over in targets.items():
-            step = BUBBLE_FILL_STEP if name.startswith('tip:') else FILL_STEP
+            step = (OPEN_FILL_STEP if name in ('open', 'close') else BUBBLE_FILL_STEP if name.startswith('tip:')
+                    else CARD_DISMISS_STEP if name == 'tip_close' else SELECT_FILL_STEP)
             fill = self.fills.get(name, 0.0) + step if over else 0.0
             if fill >= 0.98:
                 press, fill = name, 0.0
@@ -1116,12 +1198,13 @@ class OverlayView(QMainWindow):
             self.state = 'cooldown'
         elif press and press.startswith('tip:'):
             self.card_slot = self.tip_slots.pop(int(press.split(':')[1]), 0)
-            self._card_away = 0   # cursor starts on the card (it grows from the bubble)
-        elif press is None and self.state == 'open' and self.cards:
-            # detail card: close once the cursor has been off it for a moment
-            self._card_away = 0 if hover['card'] else self._card_away + 1
-            if self._card_away >= CARD_LEAVE_FRAMES:
+            self._card_armed = False  # cursor starts on the card (it grows from the bubble)
+        elif press is None:  # time's up: the card closes / the answer moves on to the questions
+            if self.cards and self._card_shown[0] is not None and self._remaining(self._card_shown[1]) <= 0:
                 press = 'tip_close'
+            elif self.state == 'open' and self._answer_shown[0] is not None \
+                    and self._remaining(self._answer_shown[1]) <= 0:
+                press = 'next'
         return press
 
     def clearCanvas(self):

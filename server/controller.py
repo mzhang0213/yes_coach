@@ -26,7 +26,9 @@ SCREENSHOT_LEAD_S = 2.0     # use the frame this long before the event (pre-deat
 
 QUICK_FRESH_S = 15          # Gemini suggestions younger than this (game s) open instantly instead of re-asking
 SUGGEST_RETRY_S = 5         # min wall seconds between suggest calls (stops a failing call re-firing every frame)
-STATE_POLL_S = 1.0          # how often the state toast's live data is refreshed
+STATE_POLL_S = 1.0          # how often the state toast's live data / the client phase is refreshed
+DRAFT_DEBOUNCE_S = 6        # min wall seconds between champ select advice calls (picks change fast)
+DRAFT_MAX_TOKENS = 700      # reads + full rune page + summoners don't fit the one-shot default
 
 
 class OverlayController:
@@ -45,7 +47,13 @@ class OverlayController:
         self._suggest_landed = False  # a suggest call finished → refresh the open panel's rows
         # answer calls: only the latest id may write game.answer (Cancel/✕/new question bump it)
         self._ask_rid = 0
+        # champ select advice calls: signature asked for last + when
+        self._draft_asked = None
+        self._draft_last_start = float('-inf')
+        self._draft_raw = None
+        self._game_id = model.game.game_id
         threading.Thread(target=self._poll_live_state, daemon=True).start()
+        threading.Thread(target=self._load_static, daemon=True).start()
         self._screenshots = os.environ.get("COACH_SCREENSHOTS") == "1"
         if self._screenshots:
             SCREEN_CAP.start_capture(history_seconds=SCREENSHOT_HISTORY_S,
@@ -83,17 +91,22 @@ class OverlayController:
         try:
             coach = self._get_coach()
             if coach is None:
-                answer = "Coach unavailable — check the console for the init error."
+                answer = {"action": "", "text": "Coach unavailable — check the console for the init error."}
             else:
-                result = coach.get_advice(question, context=game.coach_context())
-                if isinstance(result, dict) and result.get("answer"):
-                    answer = str(result["answer"])
-                    if result.get("follow_up"):
-                        answer += f"\n\nNext: {result['follow_up']}"
+                if game.phase == "ChampSelect":  # no live game yet: the draft is the state
+                    result = coach.get_advice(question, state=game.draft_context(),
+                                              context=game.loadout_options())
+                else:
+                    result = coach.get_advice(question, context=game.coach_context())
+                if isinstance(result, dict) and (result.get("why") or result.get("answer")) \
+                        and "priority" not in result:
+                    answer = {"action": str(result.get("action") or ""),
+                              "text": str(result.get("why") or result.get("answer"))}
                 else:  # get_advice error dict: {priority, action, warning}
-                    answer = f"Couldn't get an answer: {result.get('action') if isinstance(result, dict) else result}"
+                    err = result.get('action') if isinstance(result, dict) else result
+                    answer = {"action": "", "text": f"Couldn't get an answer: {err}"}
         except Exception as e:
-            answer = f"Couldn't get an answer: {e}"
+            answer = {"action": "", "text": f"Couldn't get an answer: {e}"}
         if rid == self._ask_rid and game.question == question:
             game.answer = answer
         else:
@@ -111,8 +124,7 @@ class OverlayController:
             self._show_suggestions()
         elif press == 'close':
             self._ask_rid += 1                # drop any answer still in flight
-            game.suggestions = game.question = game.answer = None
-            game.open_tip = None
+            game.suggestions = game.question = game.answer = None  # an open tip card stays
         elif press.startswith('tip:'):        # bubble popped → detail card
             game.pop_tip(int(press.split(':')[1]), game.clock)
         elif press == 'tip_close':
@@ -164,27 +176,56 @@ class OverlayController:
             return
         try:
             result = coach.get_advice(f"Quick tip for the player about: {tip.headline}. "
-                                      f"Facts so far: {tip.detail}",
+                                      f"Facts so far: {tip.detail} Rule-based action: {tip.action}. "
+                                      f"Give a sharper, more specific action if the state allows.",
                                       schema_key="tip", context=self.model.game.coach_context(), one_shot=True)
         except Exception as e:
             print(f"[coach] tip detail failed: {e}")
             return
-        detail = result.get("detail") if isinstance(result, dict) else None
-        if isinstance(detail, str) and detail.strip():
-            tip.detail, tip.detail_by = detail.strip(), "coach"
+        action = result.get("action") if isinstance(result, dict) and "priority" not in result else None
+        why = result.get("why") if isinstance(result, dict) else None
+        if isinstance(action, str) and action.strip():
+            tip.action, tip.detail_by = action.strip(), "coach"
+            if isinstance(why, str) and why.strip():
+                tip.detail = why.strip()
         else:
             print(f"[coach] tip detail failed: {result}")
 
     def _poll_live_state(self):
-        """Worker: keep game.live_state (the compressed state the coach gets) fresh
-        for the view's state toast. Off the GUI thread: it's 3 Riot requests."""
+        """Worker: follow the League client's phase; in champ select read the session,
+        otherwise keep game.live_state (the compressed state the coach gets) fresh for the
+        state toast. Off the GUI thread: these are Riot requests. Plain writes only."""
         from server.resources.gemini import compress_game_state
+        game = self.model.game
         while True:
             try:
-                self.model.game.live_state = compress_game_state()
+                game.lcu_phase = get_gameflow_phase()  # None = client not running
             except Exception:
-                self.model.game.live_state = None  # no game / client unreachable
+                game.lcu_phase = None
+            if game.lcu_phase is not None and game.player is None:  # rank + mastery, once per game
+                try:
+                    game.player = get_player_profile()
+                except Exception:
+                    pass
+            if game.lcu_phase == "ChampSelect":
+                try:
+                    game.champ_select_raw = get_champ_select_session()
+                except Exception:
+                    pass
+                game.live_state = None
+            else:
+                try:
+                    game.live_state = compress_game_state()
+                except Exception:
+                    game.live_state = None  # no game / client unreachable
             time.sleep(STATE_POLL_S)
+
+    def _load_static(self):
+        """Worker: Data Dragon champion / spell / rune data for champ select (cached per patch)."""
+        try:
+            self.model.game.static = load_static_data()
+        except Exception as e:
+            print(f"[coach] couldn't load champion data: {e}")
 
     def _screenshot_for(self, event_time):
         """JPEG from just before a game-time event, or None if screenshots are off.
@@ -199,7 +240,8 @@ class OverlayController:
         return s is not None and self.model.game.clock - s[0] <= QUICK_FRESH_S
 
     def _can_suggest(self):
-        return (not self._coach_failed and not self._suggest_inflight
+        # champ select offers the fixed draft questions only (situational ones need the live game)
+        return (not self._coach_failed and not self._suggest_inflight and self.model.game.phase != "ChampSelect"
                 and time.monotonic() - self._suggest_last_start >= SUGGEST_RETRY_S)
 
     def _start_suggest(self, event_time=None):
@@ -226,7 +268,7 @@ class OverlayController:
                 if isinstance(qs, list) and qs:
                     # stamped with the clock when they arrive (not the event time) so
                     # freshness measures how old the questions really are
-                    game.llm_suggestions = (game.clock, [str(q) for q in qs][:3])
+                    game.llm_suggestions = (game.clock, [str(q) for q in qs][:5])
                     print(f"[coach] suggestions ({'with' if image else 'no'} screenshot): {game.llm_suggestions[1]}")
                 else:
                     print(f"[coach] suggest failed: {result}")
@@ -250,8 +292,57 @@ class OverlayController:
             game.suggestions = game.current_suggestions()
             self._suggest_landed = False
 
+    def _update_draft(self, game):
+        """Main thread, champ select: fold in the latest session, ask the coach for comp
+        reads + loadout when the picks change (debounced), apply a landed reply."""
+        raw = game.champ_select_raw
+        if raw is not None and raw is not self._draft_raw:
+            self._draft_raw = raw
+            game.ingest_draft(raw)
+        sig = game.draft_signature
+        if (sig and sig != self._draft_asked and not self._coach_failed and game.static
+                and (sig[0] or sig[2])  # something to reason about: my pick or enemy picks
+                and time.monotonic() - self._draft_last_start >= DRAFT_DEBOUNCE_S):
+            self._draft_asked, self._draft_last_start = sig, time.monotonic()
+            threading.Thread(target=self._run_draft, args=(sig,), daemon=True).start()
+        game.apply_draft_advice()
+
+    def _run_draft(self, sig):
+        """Worker body: champ select comp reads + runes/summoners → game.draft_advice."""
+        coach = self._get_coach()
+        if coach is None:
+            return
+        game = self.model.game
+        result = coach.get_advice(
+            "Read both team comps from general matchup / counter knowledge and pick my runes and "
+            "summoner spells for this game (only from rune_options / summoner_options). If my champion "
+            "isn't picked yet, leave runes and summoners null.",
+            schema_key="draft", state=game.draft_context(), context=game.loadout_options(),
+            one_shot=True, max_tokens=DRAFT_MAX_TOKENS)
+        if isinstance(result, dict) and ("reads" in result or "runes" in result):
+            game.draft_advice = (sig, result)
+            print(f"[coach] draft advice for {sig[0]}: {[r.get('headline') for r in result.get('reads') or []]}")
+        else:
+            print(f"[coach] draft advice failed: {result}")
+
+    def _check_new_game(self, game):
+        """The model started a new game: drop per-game controller + coach state too."""
+        if game.game_id == self._game_id:
+            return
+        self._game_id = game.game_id
+        self._draft_asked, self._draft_raw = None, None
+        self._draft_last_start = float('-inf')
+        if self._coach is not None:
+            self._coach.new_session()
+        print(f"[coach] new game (#{game.game_id})")
+
     def update_game_state(self, model: OverlayModel):
         #read state from Riot API at curr time (RN) and log in memory
+        model.game.set_phase(model.game.lcu_phase)
+        self._check_new_game(model.game)
+        if model.game.phase == "ChampSelect":
+            self._update_draft(model.game)
+            return  # no Live Client API until the game loads
         try:
             stats = get_game_stats()
             events = get_event_data()
@@ -265,6 +356,7 @@ class OverlayController:
                 pass  # retry next tick
 
         snap = model.game.ingest(stats, events)
+        self._check_new_game(model.game)  # ingest() notices a new game by the clock going backwards
         if model.game.suggest_trigger:
             ev, model.game.suggest_trigger = model.game.suggest_trigger, None
             self._start_suggest(ev.get("EventTime"))

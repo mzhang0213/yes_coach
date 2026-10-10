@@ -17,8 +17,10 @@ from server.resources.league.league_model import (
     EventCheckpoint,
     LeagueModel,
     LeagueSnapshot,
-    GENERIC_QUESTIONS,
     CHECKPOINTS,
+    DRAFT_QUESTIONS,
+    GENERIC_QUESTIONS,
+    parse_draft,
     suggest_questions,
 )
 from server.resources.game_model import TIP_COOLDOWN_S
@@ -209,17 +211,13 @@ def ctx(deaths=(), takedowns=(), objectives=()):
             "objectives": list(objectives)}
 
 
-def test_suggest_nothing_happened_is_generic():
-    assert suggest_questions(ctx()) == GENERIC_QUESTIONS
+def test_suggest_nothing_happened_is_empty_not_filler():
+    assert suggest_questions(ctx()) == []
 
 
-def test_suggest_death_variants():
-    gank = suggest_questions(ctx(deaths=[{"t": 1, "killer": "Zed", "assisters": ["Lee Sin", "Vi"]}]))
-    assert gank[:2] == ["Why did I die?", "Was I caught out of position?"]
-    solo = suggest_questions(ctx(deaths=[{"t": 1, "killer": "Zed", "assisters": []}]))
-    assert solo[:2] == ["Why did I die?", "Could I have won that fight?"]
-    tower = suggest_questions(ctx(deaths=[{"t": 1, "killer": "Turret_T2_L_03_A", "assisters": []}]))
-    assert tower[:2] == ["Why did I die?", "Should I have dived there?"]
+def test_suggest_death_is_one_question():
+    for assisters in ([], ["Lee Sin", "Vi"]):
+        assert suggest_questions(ctx(deaths=[{"t": 1, "killer": "Zed", "assisters": assisters}])) == ["Why did I die?"]
 
 
 def test_suggest_objectives_newest_first_and_capped():
@@ -231,8 +229,7 @@ def test_suggest_objectives_newest_first_and_capped():
             {"t": 4, "type": "turret", "by": "ally"},
             {"t": 5, "type": "baron", "by": "unknown"},   # unknown side → no question
         ]))
-    assert qs == ["Why did I die?", "Could I have won that fight?",
-                  "Where do I go after turret?", "Should I have contested dragon?",
+    assert qs == ["Why did I die?", "Where do I go after turret?", "Should I have contested dragon?",
                   "How do I use this lead?"]
 
 
@@ -267,20 +264,42 @@ def test_current_suggestions_prefers_fresh_llm():
     ]})
     m.llm_suggestions = (490.0, ["Why did Zed kill me?", "why did i die?"])
     qs = m.current_suggestions()
-    assert qs == ["Why did Zed kill me?", "why did i die?", "Could I have won that fight?"] + GENERIC_QUESTIONS
-    assert "Why did I die?" not in qs                   # case-insensitive dedupe vs rules
+    assert qs == ["Why did Zed kill me?"] + GENERIC_QUESTIONS   # one death question, Gemini's first
+    assert "Why did I die?" not in qs
 
     m.ingest({"gameTime": 560.0}, {"Events": []})       # 70 s after: LLM ones are stale
-    assert m.current_suggestions() == GENERIC_QUESTIONS  # and the death left the window
+    assert m.current_suggestions() == GENERIC_QUESTIONS  # death left the window → 5 × "--" + defaults
 
 
-def test_current_suggestions_pinned_always_last_and_not_repeated():
+def test_current_suggestions_capped_at_five():
     m = rostered_model()
-    m.ingest({"gameTime": 500.0}, {"Events": []})
-    m.llm_suggestions = (499.0, ["what should i do now?", "Is dragon worth it?", "How's my CS?", "Who to watch?"])
-    qs = m.current_suggestions()
-    assert qs == ["Is dragon worth it?", "How's my CS?", "Who to watch?"] + GENERIC_QUESTIONS
-    assert m.pinned_questions == GENERIC_QUESTIONS
+    m.ingest({"gameTime": 500.0}, {"Events": [
+        {"EventID": 1, "EventName": "ChampionKill", "EventTime": 490.0,
+         "KillerName": "Foe", "VictimName": "Me", "Assisters": []}]})
+    m.llm_suggestions = (499.0, ["what should i do now?", "Is dragon worth it?", "How's my CS?",
+                                 "Who to watch?", "Can I 1v1 Zed?", "Where's their jungler?"])
+    assert m.current_suggestions() == ["Is dragon worth it?", "How's my CS?", "Who to watch?",
+                                       "Can I 1v1 Zed?", "Where's their jungler?"] + GENERIC_QUESTIONS
+
+
+def test_one_question_per_topic():
+    m = rostered_model()
+    m.ingest({"gameTime": 500.0}, {"Events": [
+        {"EventID": 1, "EventName": "ChampionKill", "EventTime": 490.0,
+         "KillerName": "Foe", "VictimName": "Me", "Assisters": []}]})
+    m.llm_suggestions = (499.0, ["Why did I die?", "Was I overextended?", "Could I have won that fight?",
+                                 "Should we take dragon?", "Is the drake worth contesting?",
+                                 "Should I buy armor?", "Can I dive bot?"])
+    assert m.current_suggestions() == ["Why did I die?", "Should we take dragon?", "Can I dive bot?"] \
+        + GENERIC_QUESTIONS   # build topic is already covered by the pinned "What should I buy next?"
+
+
+def test_question_topic_whole_words():
+    from server.resources.league.league_model import question_topic
+    assert question_topic("Should I back now?") == "build"
+    assert question_topic("How do I hit their backline?") is None   # "back" ≠ "backline"
+    assert question_topic("Was I overextended?") == "death"
+    assert question_topic("Are grubs worth it?") == "grubs"
 
 
 def test_current_suggestions_llm_expire_30s_after_generation():
@@ -298,10 +317,10 @@ def test_coach_context_clock_and_first_dragon():
     m = rostered_model()
     m.ingest({"gameTime": 245.0}, {"Events": []})
     ctx = m.coach_context()
-    assert ctx["clock"] == "4:05" and ctx["dragon"] == "spawns at 5:00"
+    assert ctx["clock"] == "4:05" and ctx["timers"]["dragon"] == "spawns at 5:00"
     assert ctx["t"] == 245 and "my_deaths" in ctx   # still carries recent_context()
     m.ingest({"gameTime": 360.0}, {"Events": []})
-    assert m.coach_context()["dragon"] == "alive now"
+    assert m.coach_context()["timers"]["dragon"] == "alive now"
 
 
 def test_coach_context_dragon_respawn_after_kill():
@@ -310,7 +329,7 @@ def test_coach_context_dragon_respawn_after_kill():
         {"EventID": 1, "EventName": "DragonKill", "EventTime": 390.0, "KillerName": "Buddy",
          "DragonType": "Fire", "Stolen": "False"},
     ]})
-    assert m.coach_context()["dragon"] == "spawns at 11:30"
+    assert m.coach_context()["timers"]["dragon"] == "spawns at 11:30"
 
 
 def test_coach_context_no_dragon_timer_after_four():
@@ -318,7 +337,7 @@ def test_coach_context_no_dragon_timer_after_four():
     m.ingest({"gameTime": 2000.0}, {"Events": [
         {"EventID": i, "EventName": "DragonKill", "EventTime": 300.0 * i, "KillerName": "Buddy",
          "DragonType": "Fire", "Stolen": "False"} for i in range(1, 5)]})
-    assert "dragon" not in m.coach_context()
+    assert m.coach_context()["timers"]["dragon"].startswith("soul/elder")
 
 
 def test_tip_categories():
@@ -334,6 +353,264 @@ def test_tip_categories():
     assert m.tips[0].category == "farm"
     grubs = next(cp for cp in CHECKPOINTS if cp.title == "void grubs spawn")
     assert tip_model(365.0, {"cs": 60}).checkpoint_tip(grubs).category == "objective"
+
+
+def test_objective_timers_current_patch():
+    m = rostered_model()
+    m.ingest({"gameTime": 300.0}, {"Events": []})
+    assert m.objective_timers() == {"dragon": "alive now", "grubs": "spawns at 8:00",
+                                    "herald": "spawns at 15:00", "baron": "spawns at 20:00"}
+    m.ingest({"gameTime": 600.0}, {"Events": []})
+    assert m.objective_timers()["grubs"] == "alive until 14:45"
+    m.ingest({"gameTime": 900.0}, {"Events": []})
+    assert m.objective_timers()["grubs"].startswith("gone") and m.objective_timers()["herald"] == "alive now"
+    m.ingest({"gameTime": 1300.0}, {"Events": [
+        {"EventID": 1, "EventName": "HeraldKill", "EventTime": 960.0},
+        {"EventID": 2, "EventName": "BaronKill", "EventTime": 1250.0}]})
+    t = m.objective_timers()
+    assert t["herald"] == "taken" and t["baron"] == "spawns at 26:50"   # 20:50 + 6:00 respawn
+
+
+def test_checkpoint_clock_times_current_patch():
+    times = {cp.title: cp.indicator for cp in CHECKPOINTS if isinstance(cp, ClockCheckpoint)}
+    assert times["void grubs spawn"] == 480 and times["rift herald spawn"] == 900
+    assert times["first baron spawn"] == 1200
+
+
+# ── champ select ───────────────────────────────────────────────────────────
+
+STATIC = {
+    "champions": {
+        "103": {"name": "Ahri", "tags": ["Mage", "Assassin"], "attack": 3, "magic": 8},
+        "122": {"name": "Darius", "tags": ["Fighter", "Tank"], "attack": 9, "magic": 0},
+        "64": {"name": "Lee Sin", "tags": ["Fighter", "Assassin"], "attack": 8, "magic": 0},
+        "22": {"name": "Ashe", "tags": ["Marksman", "Support"], "attack": 7, "magic": 2},
+        "412": {"name": "Thresh", "tags": ["Support", "Fighter"], "attack": 5, "magic": 6},
+        "238": {"name": "Zed", "tags": ["Assassin"], "attack": 9, "magic": 1},
+        "91": {"name": "Talon", "tags": ["Assassin"], "attack": 9, "magic": 1},
+        "51": {"name": "Caitlyn", "tags": ["Marksman"], "attack": 8, "magic": 2},
+        "86": {"name": "Garen", "tags": ["Fighter", "Tank"], "attack": 7, "magic": 1},
+        "157": {"name": "Yasuo", "tags": ["Fighter", "Assassin"], "attack": 8, "magic": 4},
+        "67": {"name": "Vayne", "tags": ["Marksman", "Assassin"], "attack": 10, "magic": 1},
+    },
+    "spells": {"4": "Flash", "14": "Ignite", "3": "Exhaust", "12": "Teleport"},
+    "runes": {"Domination": [["Electrocute", "Dark Harvest"], ["Cheap Shot"], ["Eyeball Collection"], ["Ultimate Hunter"]],
+              "Sorcery": [["Arcane Comet"], ["Manaflow Band"], ["Transcendence"], ["Scorch"]]},
+}
+
+
+def session(me_champ=103, me_locked=True, allies=(122, 64, 22, 412), enemies=(238, 91, 51, 86), timer="BAN_PICK"):
+    team = [{"cellId": 0, "championId": me_champ if me_locked else 0,
+             "championPickIntent": 0 if me_locked else me_champ,
+             "assignedPosition": "middle", "spell1Id": 4, "spell2Id": 14}]
+    team += [{"cellId": i + 1, "championId": c, "assignedPosition": p}
+             for i, (c, p) in enumerate(zip(allies, ["top", "jungle", "bottom", "utility"]))]
+    picks = [{"actorCellId": c["cellId"], "type": "pick", "completed": True, "championId": c["championId"]}
+             for c in team if c["championId"]]
+    return {"localPlayerCellId": 0, "myTeam": team,
+            "theirTeam": [{"cellId": 5 + i, "championId": c} for i, c in enumerate(enemies)],
+            "actions": [[{"actorCellId": 5, "type": "ban", "completed": True, "championId": 157},
+                         {"actorCellId": 1, "type": "ban", "completed": True, "championId": 67}], picks],
+            "timer": {"phase": timer}}
+
+
+def draft_model(**kw):
+    m = LeagueModel()
+    m.static = STATIC
+    m.set_phase("ChampSelect")
+    m.ingest_draft(session(**kw))
+    return m
+
+
+def test_parse_draft():
+    d = parse_draft(session(me_locked=False), STATIC)
+    assert d["me"] == {"position": "middle", "champion": "Ahri", "locked": False, "spells": ["Flash", "Ignite"]}
+    assert [a["champion"] for a in d["allies"]] == ["Darius", "Lee Sin", "Ashe", "Thresh"]
+    assert d["allies"][3] == {"position": "utility", "champion": "Thresh", "locked": True}
+    assert d["enemies"] == ["Zed", "Talon", "Caitlyn", "Garen"] and d["bans"] == ["Yasuo", "Vayne"]
+    assert parse_draft(session(), None)["me"]["champion"] == "#103"   # static data not loaded yet
+
+
+def test_draft_rule_reads():
+    m = draft_model(enemies=(238, 91))
+    assert {t.kind for t in m.tips} == {"draft:rule:assassins"}
+    assert "Zed and Talon" in m.tips[0].detail and m.tips[0].category == "enemy"
+    m = draft_model(me_champ=51, allies=(64, 238, 22, 91), enemies=(103, 412, 22, 86))   # all AD, no tank
+    kinds = {t.kind for t in m.tips}
+    assert {"draft:rule:ad", "draft:rule:frontline"} <= kinds, kinds
+    assert next(t for t in m.tips if t.kind == "draft:rule:ad").category == "ally"
+
+
+def test_draft_ingest_only_changes_on_new_picks():
+    m = draft_model()
+    sig = m.draft_signature
+    assert sig == ("Ahri", ("Darius", "Lee Sin", "Ashe", "Thresh"), ("Zed", "Talon", "Caitlyn", "Garen"))
+    assert m.ingest_draft(session(timer="FINALIZATION")) is False      # timer tick, same picks
+    assert m.ingest_draft(session(enemies=(238, 91, 51, 86, 22))) is True
+
+
+def test_draft_advice_applies_for_current_picks_only():
+    m = draft_model()
+    adv = {"reads": [{"headline": "Dive their backline", "detail": "x", "side": "ally"},
+                     {"headline": "Zed snowballs", "detail": "y", "side": "enemy"}],
+           "runes": {"primary_tree": "Domination", "keystone": "Electrocute",
+                     "primary": ["Cheap Shot", "Eyeball Collection", "Ultimate Hunter"],
+                     "secondary_tree": "Sorcery", "secondary": ["Manaflow Band", "Transcendence"]},
+           "summoners": ["Flash", "Ignite"], "why": "Burst Zed before he burst you."}
+    m.draft_advice = (("someone else",), adv)
+    m.apply_draft_advice(); assert all(t.kind.startswith("draft:rule") for t in m.tips)   # stale → ignored
+    m.draft_advice = (m.draft_signature, adv)
+    m.apply_draft_advice()
+    tips = {t.kind: t for t in m.tips}
+    assert set(tips) == {"draft:loadout", "draft:read:0", "draft:read:1"}           # rule reads replaced
+    assert tips["draft:loadout"].category == "loadout" and tips["draft:read:1"].category == "enemy"
+    assert tips["draft:loadout"].action == "Electrocute · Flash + Ignite"
+    assert tips["draft:loadout"].detail.startswith("Domination: Cheap Shot, Eyeball Collection, Ultimate Hunter")
+    assert m.tips_on_offer()[0].kind == "draft:loadout"
+
+
+def test_draft_advice_with_stale_keystone_drops_loadout_only():
+    m = draft_model()
+    m.draft_advice = (m.draft_signature, {"reads": [{"headline": "Poke them", "side": "ally"}],
+                                          "runes": {"keystone": "Thunderlord's Decree"}})
+    m.apply_draft_advice()
+    assert {t.kind for t in m.tips} == {"draft:read:0"}
+
+
+def test_draft_phase_questions_toast_and_cleanup():
+    m = draft_model()
+    assert m.current_suggestions() == ["How do I play vs Zed?", "How do I play vs Talon?",
+                                       "How do I play vs Caitlyn?", "How do I play vs Garen?"] + DRAFT_QUESTIONS
+    lines = m.state_lines()
+    assert lines[:3] == ["Champ select · picks & bans", "You: Ahri · middle", "Spells: Flash + Ignite"]
+    assert lines[-1] == "Bans: Yasuo, Vayne"
+    m.set_phase("InProgress")
+    assert m.tips == [] and m.draft is None and m.current_suggestions() == GENERIC_QUESTIONS
+    assert m.my_position == "middle"                                   # outlives champ select
+
+
+def test_draft_position_fixes_support_cs_tip():
+    m = draft_model(); m.draft["me"]["position"] = "utility"; m.my_position = "utility"
+    m.set_phase("InProgress")
+    m.live_state = {**LIVE, "cs": 10}
+    m.ingest({"gameTime": 600.0}, {"Events": []})                       # no roster position from Live API
+    m.update_tips()
+    assert "cs_low" not in {t.kind for t in m.tips}
+
+
+def test_draft_context_for_coach():
+    ctx = draft_model(me_locked=False).draft_context()
+    assert ctx["my_champion"] == "Ahri (hovering)" and ctx["phase"] == "champ select (picks & bans)"
+    assert ctx["allies"][0] == "Darius (top)" and ctx["enemies"][0] == "Zed"
+
+
+# ── new game reset ─────────────────────────────────────────────────────────
+
+DEATH_EV = {"EventID": 7, "EventName": "ChampionKill", "EventTime": 590.0,
+            "KillerName": "Foe", "VictimName": "Me", "Assisters": []}
+
+
+def play_first_game(m):
+    m.set_roster("Me#NA1", ROSTER)
+    m.live_state = {**LIVE, "cs": 40, "g": 0}
+    m.ingest({"gameTime": 600.0}, {"Events": [DEATH_EV]})
+    fired = m.evaluate_checkpoints(m.ingest({"gameTime": 600.0}, {"Events": []}))
+    m.update_tips()
+    return fired
+
+
+def test_second_game_via_champ_select_is_fresh():
+    m = LeagueModel(); m.static = STATIC
+    m.set_phase("InProgress")
+    fired = play_first_game(m)
+    assert "void grubs spawn" in [cp.title for cp in fired] and m.tips and m.roster
+    gid = m.game_id
+
+    m.set_phase("EndOfGame"); m.set_phase("Lobby"); m.set_phase("ChampSelect")
+    assert m.game_id == gid + 1
+    assert m.roster == {} and m.tips == [] and m.recent_events == [] and m.clock == 0.0
+    assert m.dragon_count == 0 and m.llm_suggestions is None and m.seen_event_ids == set()
+    m.ingest_draft(session())
+    assert m.my_position == "middle"
+
+    m.set_phase("InProgress")                          # game loads: no second reset
+    assert m.game_id == gid + 1 and m.my_position == "middle"
+    m.set_roster("Me#NA1", ROSTER)
+    m.ingest({"gameTime": 600.0}, {"Events": [DEATH_EV]})   # same EventID as last game
+    assert m.recent_context()["my_deaths"], "event ignored as already seen"
+    fired = m.evaluate_checkpoints(m.ingest({"gameTime": 600.0}, {"Events": []}))
+    assert "void grubs spawn" in [cp.title for cp in fired]   # latches reset
+
+
+def test_checkpoints_not_shared_between_models():
+    a, b = LeagueModel(), LeagueModel()
+    a.evaluate_checkpoints(a.ingest({"gameTime": 500.0}, {"Events": []}))
+    assert [cp.title for cp in b.evaluate_checkpoints(b.ingest({"gameTime": 500.0}, {"Events": []}))] \
+        == ["void grubs spawn"]
+
+
+def test_new_game_fallback_when_clock_goes_backwards():
+    m = LeagueModel()
+    play_first_game(m)
+    gid = m.game_id
+    m.ingest({"gameTime": 590.0}, {"Events": []})      # small jitter: same game
+    assert m.game_id == gid
+    m.ingest({"gameTime": 5.0}, {"Events": [DEATH_EV]})   # no client API, new game started
+    assert m.game_id == gid + 1 and m.tips == [] and m.roster == {}
+    assert len(m.recent_events) == 1                   # its events are ingested fresh
+
+
+def test_dodge_restarts_champ_select():
+    m = LeagueModel(); m.static = STATIC
+    m.set_phase("Lobby"); m.set_phase("ChampSelect"); m.ingest_draft(session())
+    gid = m.game_id
+    m.set_phase("Lobby"); m.set_phase("ChampSelect")
+    assert m.game_id == gid + 1 and m.draft is None and m.my_position == ""
+
+
+# ── levels of play / experience ────────────────────────────────────────────
+
+PROFILE = {"solo": "SILVER III", "flex": "GOLD IV", "account_level": 211, "mastery": {"103": 74994}}
+
+
+def test_bracket_from_rank_flex_account_and_override():
+    m = LeagueModel()
+    assert m.bracket == "low"                                         # unknown
+    m.player = PROFILE; assert m.bracket == "low"                     # solo Silver
+    m.player = {**PROFILE, "solo": None}; assert m.bracket == "mid"   # falls back to flex Gold
+    m.player = {"solo": None, "flex": None, "account_level": 12}; assert m.bracket == "new"
+    m.player = {**PROFILE, "solo": "DIAMOND II"}; assert m.bracket == "high"
+    os.environ["COACH_RANK"] = "emerald"
+    try:
+        assert m.bracket == "mid"
+    finally:
+        del os.environ["COACH_RANK"]
+
+
+def test_champ_experience_from_mastery():
+    m = draft_model()                                                  # Ahri in champ select
+    m.player = PROFILE
+    assert m.champ_experience() == "experienced on this champion (74k mastery)"
+    m.player = {**PROFILE, "mastery": {}}
+    assert m.champ_experience() == "new to this champion (0k mastery)"
+    assert m.draft_context()["player"] == {"level_of_play": "low elo (Iron–Silver)", "rank": "Silver III",
+                                           "account_level": 211,
+                                           "champion_experience": "new to this champion (0k mastery)"}
+
+
+def test_cs_tip_scales_with_bracket_and_shows_gap():
+    m = tip_model(600.0, {"cs": 50, "g": 0})                           # 5.0/min at 10:00
+    m.player = {**PROFILE, "solo": "IRON II"}; m.update_tips()
+    assert "cs_low" not in kinds(m)                                    # fine for low elo (warn < 4.5)
+    m = tip_model(600.0, {"cs": 50, "g": 0}); m.player = {**PROFILE, "solo": "DIAMOND I"}; m.update_tips()
+    tip = next(t for t in m.tips if t.kind == "cs_low")
+    assert "30 CS (~600g) behind 8/min" in tip.detail and tip.action
+
+
+def test_tips_have_actions():
+    m = tip_model(500.0, {"cs": 10, "g": 1600}, [DEATH_EV | {"EventTime": 480.0, "Assisters": ["Jungler", "Buddy"]}])
+    m.update_tips()
+    assert m.tips and all(t.action for t in m.tips), [(t.kind, t.action) for t in m.tips]
 
 
 # ── state toast ────────────────────────────────────────────────────────────
@@ -449,7 +726,8 @@ def test_tips_pop_logs_and_opens_card():
 def test_checkpoint_tips_fresh_only():
     by_title = {cp.title: cp for cp in CHECKPOINTS}
     m = tip_model(365.0, {"cs": 60})
-    assert m.checkpoint_tip(by_title["void grubs spawn"]).headline == "Void Grubs are up"
+    grubs = m.checkpoint_tip(by_title["void grubs spawn"])
+    assert grubs.headline == "Grubs are up" and grubs.action.startswith("Shove")
     m = tip_model(20 * 60.0, {"cs": 200})               # launched mid-game: 6:00 is long gone
     assert m.checkpoint_tip(by_title["void grubs spawn"]) is None
     m = tip_model(1600.0, {"cs": 200}, [{"EventID": 9, "EventName": "BaronKill", "EventTime": 1590.0}])

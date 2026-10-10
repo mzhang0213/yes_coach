@@ -46,3 +46,5 @@ Thumbs.db
 screenshots/
 captures/
 recordings/
+# generated Data Dragon cache (champion/spell/rune static data)
+server/resources/league/ddragon_cache.json
