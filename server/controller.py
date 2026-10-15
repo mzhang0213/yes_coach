@@ -29,6 +29,7 @@ SUGGEST_RETRY_S = 5         # min wall seconds between suggest calls (stops a fa
 STATE_POLL_S = 1.0          # how often the state toast's live data / the client phase is refreshed
 DRAFT_DEBOUNCE_S = 6        # min wall seconds between champ select advice calls (picks change fast)
 DRAFT_MAX_TOKENS = 700      # reads + full rune page + summoners don't fit the one-shot default
+DRAFT_TIMEOUT_S = 10        # champ select isn't time-critical, and the reply is long
 
 
 class OverlayController:
@@ -85,32 +86,59 @@ class OverlayController:
         threading.Thread(target=self._run_ask, args=(self._ask_rid, question), daemon=True).start()
 
     def _run_ask(self, rid, question):
-        """Worker body: answer a question → game.answer. Dropped if the panel
-        moved on (Cancel/✕/another question) while it ran."""
+        """Worker body: answer a question → game.answer, fast first. If the quick answer says it
+        needs more thought (or failed in a way thinking may fix), show it marked "refining" and
+        amend it with a slower thinking pass. Dropped if the panel moved on (Cancel/✕/another
+        question) while it ran."""
         game = self.model.game
-        try:
-            coach = self._get_coach()
-            if coach is None:
-                answer = {"action": "", "text": "Coach unavailable — check the console for the init error."}
-            else:
-                if game.phase == "ChampSelect":  # no live game yet: the draft is the state
-                    result = coach.get_advice(question, state=game.draft_context(),
-                                              context=game.loadout_options())
-                else:
-                    result = coach.get_advice(question, context=game.coach_context())
-                if isinstance(result, dict) and (result.get("why") or result.get("answer")) \
-                        and "priority" not in result:
-                    answer = {"action": str(result.get("action") or ""),
-                              "text": str(result.get("why") or result.get("answer"))}
-                else:  # get_advice error dict: {priority, action, warning}
-                    err = result.get('action') if isinstance(result, dict) else result
-                    answer = {"action": "", "text": f"Couldn't get an answer: {err}"}
-        except Exception as e:
-            answer = {"action": "", "text": f"Couldn't get an answer: {e}"}
+        coach = self._get_coach()
+        if coach is None:
+            self._set_answer(rid, question, {"action": "", "text": "Coach unavailable — check the console for the init error."})
+            return
+        quick = self._answer(coach, question)
+        ok = not quick.get("error")
+        refine = coach.can_think and (quick.get("more_thought") is True if ok
+                                      else quick["error"] in ("timeout", "bad_reply"))
+        answer = self._answer_card(quick)
+        if refine:
+            answer["note"] = "Thinking it over…" if ok else "Quick answer failed — thinking it over…"
+            answer["refining"] = True
+        if not self._set_answer(rid, question, answer) or not refine:
+            return
+        deep = self._answer(coach, f"Think it through carefully and revise your last answer if it was "
+                                   f"wrong or too vague: {question}" if ok else question, deep=True)
+        if not deep.get("error"):
+            revised = self._answer_card(deep)
+            if ok and revised["action"] != answer["action"]:
+                revised["note"] = "Revised after a closer look"
+            self._set_answer(rid, question, revised)
+        elif ok:  # keep the quick answer, just stop the spinner
+            self._set_answer(rid, question, self._answer_card(quick))
+        else:
+            self._set_answer(rid, question, self._answer_card(deep))
+
+    def _answer(self, coach, question, deep=False):
+        game = self.model.game
+        if game.phase == "ChampSelect":  # no live game yet: the draft is the state
+            return coach.get_advice(question, state=game.draft_context(),
+                                    context=game.loadout_options(), deep=deep)
+        return coach.get_advice(question, context=game.coach_context(), deep=deep)
+
+    @staticmethod
+    def _answer_card(result):
+        """Coach reply (or get_advice error dict) → {"action", "text"} for the panel."""
+        if not result.get("error") and (result.get("why") or result.get("answer")):
+            return {"action": str(result.get("action") or ""), "text": str(result.get("why") or result.get("answer"))}
+        return {"action": "", "text": f"Couldn't get an answer: {result.get('action') or 'empty reply'}"}
+
+    def _set_answer(self, rid, question, answer):
+        """Write game.answer if the panel still waits on this question; False if it moved on."""
+        game = self.model.game
         if rid == self._ask_rid and game.question == question:
             game.answer = answer
-        else:
-            print(f"[coach] dropped stale answer to {question!r}")
+            return True
+        print(f"[coach] dropped stale answer to {question!r}")
+        return False
 
     def handle_press(self, press):
         """Turn a view press into model changes."""
@@ -182,7 +210,7 @@ class OverlayController:
         except Exception as e:
             print(f"[coach] tip detail failed: {e}")
             return
-        action = result.get("action") if isinstance(result, dict) and "priority" not in result else None
+        action = result.get("action") if not result.get("error") else None
         why = result.get("why") if isinstance(result, dict) else None
         if isinstance(action, str) and action.strip():
             tip.action, tip.detail_by = action.strip(), "coach"
@@ -318,7 +346,7 @@ class OverlayController:
             "summoner spells for this game (only from rune_options / summoner_options). If my champion "
             "isn't picked yet, leave runes and summoners null.",
             schema_key="draft", state=game.draft_context(), context=game.loadout_options(),
-            one_shot=True, max_tokens=DRAFT_MAX_TOKENS)
+            one_shot=True, max_tokens=DRAFT_MAX_TOKENS, timeout_s=DRAFT_TIMEOUT_S)
         if isinstance(result, dict) and ("reads" in result or "runes" in result):
             game.draft_advice = (sig, result)
             print(f"[coach] draft advice for {sig[0]}: {[r.get('headline') for r in result.get('reads') or []]}")

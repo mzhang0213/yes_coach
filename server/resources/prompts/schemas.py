@@ -14,6 +14,8 @@ SCHEMAS: dict[str, dict] = {
     "question": {
         "action": "the one thing to do, imperative, max 12 words (who / where / when)",
         "why":    "one sentence naming the specific numbers, champions or timers behind it",
+        "more_thought": "true only if a careful second look could change the action (close fight or "
+                        "trade math, several objectives competing), else false",
     },
 
     # Guess why the player opened the coach and offer questions to ask

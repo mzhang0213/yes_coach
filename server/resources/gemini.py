@@ -2,6 +2,7 @@ import base64
 import itertools
 import json
 import os
+import re
 import requests
 import urllib3
 
@@ -42,13 +43,55 @@ _MEMORY_FILE = os.path.join(os.path.dirname(__file__), "coach_memory.json")
 #   LMSTUDIO_URL      base URL of an OpenAI-compatible server, e.g. https://lm.example.com
 #   LMSTUDIO_MODEL    model id as LM Studio lists it (empty = whatever is loaded)
 #   LMSTUDIO_API_KEY  optional bearer token, e.g. for an auth proxy in front of LM Studio
+#   GEMINI_DEEP_MODEL model for the second, thinking pass on questions (default below)
 DEFAULT_GEMINI_MODEL = "gemini-2.0-flash"
-REQUEST_TIMEOUT_S = 30
+DEFAULT_DEEP_MODEL = "gemini-2.5-flash"  # 2.0-flash can't think, so the deep pass needs a 2.5+ model
+
+# per-call time limits: a late tip is a useless tip, so quick calls give up fast
+QUICK_TIMEOUT_S = 4       # one-shot calls (suggest / tip detail)
+ANSWER_TIMEOUT_S = 6      # first answer to a question
+DEEP_TIMEOUT_S = 15       # second pass that thinks before answering
+DEEP_THINKING_BUDGET = 1024
 
 
 def _load_system_prompt() -> str:
     with open(os.path.join(_PROMPTS_DIR, "context.txt")) as f:
         return f.read().strip()
+
+
+# ── Errors ────────────────────────────────────────────────────────────────────
+
+class CoachError(Exception):
+    """A coach call failed. str() is short enough to show on the overlay.
+    kind: timeout | quota | auth | unavailable | unreachable | no_game | bad_reply | error"""
+    def __init__(self, kind: str, message: str):
+        super().__init__(message)
+        self.kind = kind
+
+
+def _classify(e: Exception, backend_name: str, timeout_s: float) -> CoachError:
+    """Map SDK / HTTP / parse exceptions from any backend onto a CoachError."""
+    if isinstance(e, CoachError):
+        return e
+    # match by class name so this works for httpx (google-genai) and requests (lmstudio) alike
+    names = {c.__name__ for c in type(e).__mro__}
+    if any("Timeout" in n for n in names):
+        return CoachError("timeout", f"Coach took too long (>{timeout_s:.0f}s)")
+    if names & {"ConnectError", "ConnectionError"}:
+        return CoachError("unreachable", f"Can't reach the coach model ({backend_name})")
+    if isinstance(e, json.JSONDecodeError):
+        return CoachError("bad_reply", "Coach sent an unreadable reply")
+    code = getattr(e, "code", None)  # google.genai.errors.APIError
+    if code is None and getattr(e, "response", None) is not None:
+        code = getattr(e.response, "status_code", None)  # requests.HTTPError
+    if code == 429 or "quota" in str(e).lower():
+        return CoachError("quota", "Rate-limited on every API key — try again in a minute")
+    if code in (401, 403):
+        return CoachError("auth", "API key rejected — check your .env")
+    if isinstance(code, int) and code >= 500:
+        return CoachError("unavailable", "Coach model is overloaded — try again")
+    msg = getattr(e, "message", None) or str(e)
+    return CoachError("error", msg if len(msg) <= 120 else msg[:117] + "…")
 
 
 # ── State compression ─────────────────────────────────────────────────────────
@@ -121,18 +164,22 @@ def save_memory(game_summary: dict):
 class GeminiBackend:
     """Google Gemini via google-genai. Rotates through API keys on quota errors."""
 
-    def __init__(self, api_keys: list[str], model: str = DEFAULT_GEMINI_MODEL):
+    def __init__(self, api_keys: list[str], model: str = DEFAULT_GEMINI_MODEL,
+                 deep_model: str = DEFAULT_DEEP_MODEL):
         if not api_keys:
             raise RuntimeError("COACH_BACKEND=gemini but no GEMINI_API_KEY* is set")
         from google import genai           # deferred so the lmstudio backend
         from google.genai import types     # doesn't need google-genai installed
         self._genai, self._types = genai, types
         self._keys = itertools.cycle(api_keys)
-        self.model = model
+        self.n_keys = len(api_keys)
+        self.model, self.deep_model = model, deep_model
         self.name = f"gemini:{model} ({len(api_keys)} key{'s' if len(api_keys) > 1 else ''})"
-        # thinking models (2.5+, *-latest) count thinking against max_output_tokens and
-        # truncate the JSON — ask for no thinking; dropped if the model refuses
-        self._thinking_off = True
+        # Quick calls want no thinking: it's slow and counts against max_output_tokens (truncating
+        # the JSON). Some models refuse budget 0 (pro, gemini 3) → step down to the smallest budget
+        # they take, then to the model's default. Latched per model on the first refusal.
+        self._quick_budgets = {model: [0, 128, None]}
+        self.can_think = True  # deep pass available; latched off if the deep model refuses
         self.rotate()
 
     def rotate(self):
@@ -140,7 +187,7 @@ class GeminiBackend:
         self._client = self._genai.Client(api_key=next(self._keys))
 
     def generate(self, system: str, history: list[tuple[str, str]], prompt: str,
-                 image: bytes | None, max_tokens: int) -> str:
+                 image: bytes | None, max_tokens: int, timeout_s: float, deep: bool = False) -> str:
         t = self._types
         contents = [t.Content(role="model" if role == "assistant" else "user", parts=[t.Part(text=text)])
                     for role, text in history]
@@ -149,25 +196,46 @@ class GeminiBackend:
             parts.append(t.Part.from_bytes(data=image, mime_type="image/jpeg"))
         contents.append(t.Content(role="user", parts=parts))
         config = dict(system_instruction=system, response_mime_type="application/json",
-                      # floor: room to finish if the model thinks anyway
-                      max_output_tokens=max(max_tokens, 1024), temperature=0.4)
-        if self._thinking_off:
-            try:
-                return self._send(contents, config, t.ThinkingConfig(thinking_budget=0))
+                      http_options=t.HttpOptions(timeout=int(timeout_s * 1000)), temperature=0.4)
+        if deep:
+            try:  # thinking tokens count against the output budget → add them on top
+                return self._send(self.deep_model, contents, dict(config, max_output_tokens=DEEP_THINKING_BUDGET + max_tokens),
+                                  t.ThinkingConfig(thinking_budget=DEEP_THINKING_BUDGET))
             except Exception as e:
-                if "thinking" not in str(e).lower():
+                if _refuses_thinking(e):
+                    self.can_think = False
+                    raise CoachError("error", f"{self.deep_model} can't think — set GEMINI_DEEP_MODEL") from e
+                raise
+        budgets = self._quick_budgets.setdefault(self.model, [0, 128, None])
+        while True:
+            budget = budgets[0]
+            # floor: room to finish if the model thinks anyway
+            cfg = dict(config, max_output_tokens=max(max_tokens, 1024) + (budget or 0))
+            try:
+                return self._send(self.model, contents, cfg,
+                                  None if budget is None else t.ThinkingConfig(thinking_budget=budget))
+            except Exception as e:
+                if budget is None or not _refuses_thinking(e):
                     raise
-                self._thinking_off = False  # e.g. pro / gemini 3 models can't turn it off
-        return self._send(contents, config)
+                print(f"[coach] {self.model} refused thinking budget {budget}, trying {budgets[1]}")
+                budgets.pop(0)
 
-    def _send(self, contents, config: dict, thinking=None) -> str:
+    def _send(self, model: str, contents, config: dict, thinking=None) -> str:
         t = self._types
         response = self._client.models.generate_content(
-            model=self.model, contents=contents,
+            model=model, contents=contents,
             config=t.GenerateContentConfig(**config, thinking_config=thinking))
-        if not response.text:
-            raise RuntimeError(f"empty reply from {self.model}")
+        if not response.text:  # .text skips thought parts, so a reply that only thought is empty too
+            cand = response.candidates[0] if response.candidates else None
+            feedback = response.prompt_feedback
+            reason = (cand and cand.finish_reason) or (feedback and feedback.block_reason) or "no text"
+            raise CoachError("bad_reply", f"Coach sent no answer ({getattr(reason, 'name', reason)})")
         return response.text
+
+
+def _refuses_thinking(e: Exception) -> bool:
+    """A 400 complaining about the thinking config (budget out of range / unsupported)."""
+    return getattr(e, "code", None) == 400 and "thinking" in str(e).lower()
 
 
 class LMStudioBackend:
@@ -182,12 +250,14 @@ class LMStudioBackend:
         self.model = model
         self._headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
         self.name = f"lmstudio:{model or '(loaded model)'} @ {self._endpoint}"
+        self.n_keys = 1
+        self.can_think = False  # no thinking switch over the OpenAI API → no deep pass
 
     def rotate(self):
         pass  # single endpoint, nothing to rotate
 
     def generate(self, system: str, history: list[tuple[str, str]], prompt: str,
-                 image: bytes | None, max_tokens: int) -> str:
+                 image: bytes | None, max_tokens: int, timeout_s: float, deep: bool = False) -> str:
         user = prompt
         if image:
             data_url = "data:image/jpeg;base64," + base64.b64encode(image).decode()
@@ -199,15 +269,15 @@ class LMStudioBackend:
         body = {"messages": messages, "max_tokens": max_tokens, "temperature": 0.4}
         if self.model:
             body["model"] = self.model
-        resp = requests.post(self._endpoint, json=body, headers=self._headers, timeout=REQUEST_TIMEOUT_S)
+        resp = requests.post(self._endpoint, json=body, headers=self._headers, timeout=timeout_s)
         resp.raise_for_status()
         return resp.json()["choices"][0]["message"]["content"]
 
 
 def _parse_json(text: str) -> dict:
-    """Parse a JSON reply, tolerating ```json fences / chatter around it
+    """Parse a JSON reply, tolerating ```json fences / chatter / <think> blocks around it
     (local models don't always honour "JSON only")."""
-    text = text.strip()
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
     try:
         return json.loads(text)
     except json.JSONDecodeError:
@@ -224,7 +294,8 @@ def coach_from_env() -> "LoLCoach":
         keys = [k.strip()
                 for name, value in sorted(os.environ.items()) if name.startswith("GEMINI_API_KEY")
                 for k in value.split(",") if k.strip()]
-        return LoLCoach(GeminiBackend(keys, os.environ.get("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL))
+        return LoLCoach(GeminiBackend(keys, os.environ.get("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL,
+                                      os.environ.get("GEMINI_DEEP_MODEL") or DEFAULT_DEEP_MODEL))
     if backend == "lmstudio":
         return LoLCoach(LMStudioBackend(os.environ.get("LMSTUDIO_URL", ""),
                                         os.environ.get("LMSTUDIO_MODEL", ""),
@@ -244,17 +315,26 @@ class LoLCoach:
         # screenshots go with their own request but aren't replayed later.
         self._history, self.last_game = load_memory()
 
+    @property
+    def can_think(self) -> bool:
+        """Whether deep=True calls can work (the backend has a thinking model)."""
+        return self._backend.can_think
+
     def new_session(self):
         """New game: forget this game's chat (keeps the last-game summary from memory)."""
         self._history, self.last_game = load_memory()
 
     def _call(self, question: str | None, schema_key: str,
               context: dict | None = None, image: bytes | None = None,
-              one_shot: bool = False, state: dict | None = None, max_tokens: int | None = None) -> dict:
+              one_shot: bool = False, state: dict | None = None, max_tokens: int | None = None,
+              timeout_s: float = ANSWER_TIMEOUT_S, deep: bool = False) -> dict:
         """Build prompt, send to the backend, parse and return JSON."""
         schema = SCHEMAS[schema_key]
         if state is None:
-            state = compress_game_state()
+            try:
+                state = compress_game_state()
+            except Exception as e:
+                raise CoachError("no_game", "No live game data — is a game running?") from e
 
         prompt = (
             f"schema:{json.dumps(schema, separators=(',',':'))} "
@@ -267,17 +347,21 @@ class LoLCoach:
 
         # one-shot: no history — smaller request, faster reply, doesn't clutter the chat
         text = self._backend.generate(self._system, [] if one_shot else self._history,
-                                      prompt, image, max_tokens or (150 if one_shot else 300))
+                                      prompt, image, max_tokens or (150 if one_shot else 300), timeout_s, deep)
         result = _parse_json(text)
+        if not isinstance(result, dict):
+            raise CoachError("bad_reply", "Coach sent an unreadable reply")
         if not one_shot:
             self._history += [("user", prompt), ("assistant", text)]
         return result
 
     def get_advice(self, question: str = None, schema_key: str = "situation",
                    context: dict = None, image: bytes = None, one_shot: bool = False,
-                   state: dict = None, max_tokens: int = None) -> dict:
+                   state: dict = None, max_tokens: int = None, timeout_s: float = None,
+                   deep: bool = False) -> dict:
         """
-        Fetch live state and return coaching JSON.
+        Fetch live state and return coaching JSON. Never raises: on failure returns
+        {"error": kind, "action": short message for the overlay} (kinds: see CoachError).
 
         Args:
             question:   optional free-text player question → uses "question" schema
@@ -288,29 +372,32 @@ class LoLCoach:
             state:      game state to send instead of the live one (e.g. champ select — the
                         Live Client API doesn't exist yet)
             max_tokens: reply budget override (default 150 one-shot / 300)
+            timeout_s:  give up after this long (default QUICK_TIMEOUT_S one-shot / ANSWER_TIMEOUT_S,
+                        DEEP_TIMEOUT_S when deep)
+            deep:       let the model think first (slower, better) — only if can_think
         """
         if question and schema_key == "situation":
             schema_key = "question"
+        if timeout_s is None:
+            timeout_s = DEEP_TIMEOUT_S if deep else QUICK_TIMEOUT_S if one_shot else ANSWER_TIMEOUT_S
 
-        try:
-            return self._call(question, schema_key, context, image, one_shot, state, max_tokens)
-        except Exception as e:
-            err = str(e)
-            # Rotate to next key on quota / rate-limit errors
-            if "429" in err or "quota" in err.lower():
-                self._backend.rotate()
-                try:
-                    return self._call(question, schema_key, context, image, one_shot, state, max_tokens)
-                except Exception as e2:
-                    err = str(e2)
-            # Game client (Riot API on :2999) or model server not reachable
-            if "connect" in err.lower() or "api unavailable" in err.lower():
-                game_client = "2999" in err or "liveclientdata" in err
-                return {"priority": "API unavailable",
-                        "action": "Game client not running?" if game_client
-                                  else f"Can't reach the coach model ({self.name})",
-                        "warning": err}
-            return {"priority": "error", "action": err, "warning": None}
+        rotations, retried = 0, False
+        while True:
+            try:
+                return self._call(question, schema_key, context, image, one_shot, state, max_tokens,
+                                  timeout_s, deep)
+            except Exception as e:
+                err = _classify(e, self.name, timeout_s)
+                print(f"[coach] {schema_key}{' (deep)' if deep else ''} failed [{err.kind}]: {e}")
+                if err.kind == "quota" and rotations < self._backend.n_keys - 1:
+                    rotations += 1
+                    self._backend.rotate()
+                    continue
+                # one retry for a transient 5xx; timeouts aren't retried (that would double the wait)
+                if err.kind == "unavailable" and not retried:
+                    retried = True
+                    continue
+                return {"error": err.kind, "action": str(err)}
 
     def end_session(self, result: str, champion: str, kda: str, cs: int):
         """

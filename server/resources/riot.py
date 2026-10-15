@@ -10,7 +10,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
 def make_get_req(path: str, params: dict = None) -> dict | list | str:
-    resp = requests.get(f"{BASE}{path}", params=params, verify=False)
+    # short timeout: this runs on the GUI thread, and a loading / paused game can hang the socket
+    resp = requests.get(f"{BASE}{path}", params=params, verify=False, timeout=1)
     resp.raise_for_status()
     return resp.json()
 

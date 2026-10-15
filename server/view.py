@@ -995,9 +995,11 @@ class OverlayView(QMainWindow):
             mode = 'answering' if game.answer is None else 'answer'
             title = 'Coach'
             q_h = self._wrapped_height(game.question, inner, 13, True)
-            if mode == 'answer':  # {"action": highlighted line (may be ""), "text": why / error}
+            if mode == 'answer':  # {"action": highlighted line (may be ""), "text": why / error,
+                                  #  optional "note": small status line, "refining": a better answer is coming}
                 act_h = self._wrapped_height(game.answer["action"], inner, 13, True) + 5 if game.answer["action"] else 0
-                a_h = act_h + self._wrapped_height(game.answer["text"], inner, 11)
+                note_h = 22 if game.answer.get("note") else 0
+                a_h = act_h + self._wrapped_height(game.answer["text"], inner, 11) + note_h
             else:
                 a_h = 24
             body_h = q_h + 10 + a_h
@@ -1009,7 +1011,8 @@ class OverlayView(QMainWindow):
         y = max(10, min(iy - ICON_INSET, SCREEN_SIZE[1] - h - 10))
         countdown = None
         if mode == 'answer':
-            if self._answer_shown[0] is not game.answer:
+            # a refining answer is about to change → don't count down until the final one is in
+            if self._answer_shown[0] is not game.answer or game.answer.get("refining"):
                 self._answer_shown = (game.answer, time.monotonic())
             countdown = self._remaining(self._answer_shown[1])
         else:
@@ -1079,8 +1082,17 @@ class OverlayView(QMainWindow):
                 self.labels.append({'x': x + PANEL_PAD, 'y': ay, 'w': inner, 'h': act_h,
                                     'text': game.answer["action"], 'size': 13, 'bold': True, 'color': ACTION_COLOR})
                 ay += act_h
-            self.labels.append({'x': x + PANEL_PAD, 'y': ay, 'w': inner, 'h': a_h,
+            text_h = a_h - act_h - note_h
+            self.labels.append({'x': x + PANEL_PAD, 'y': ay, 'w': inner, 'h': text_h,
                                 'text': game.answer["text"], 'size': 11})
+            if note_h:
+                ny, nx = ay + text_h + 4, x + PANEL_PAD
+                if game.answer.get("refining"):
+                    self.spinners.append({'cx': nx + 7, 'cy': ny + 9, 'r': 6})
+                    nx += 20
+                self.labels.append({'x': nx, 'y': ny, 'w': x + PANEL_W - PANEL_PAD - nx, 'h': 18,
+                                    'text': game.answer["note"], 'size': 10, 'color': (150, 150, 170),
+                                    'vcenter': True})
         return x, y, h
 
     @staticmethod
